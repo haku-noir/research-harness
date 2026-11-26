@@ -5,7 +5,7 @@
 # 止めるもの：
 #   1. ひな形のリポジトリへの push（リモート名 template、またはその URL を直接指定したもの）
 #   2. 許可していないリモートへの push（許可は git config の hub.pushAllowed に、リモート名で書く）
-#   3. 許可したリモートでも、履歴を書き換える push（force push）と、ブランチやタグの削除
+#   3. 許可したリモートでも、履歴を書き換える push（force push）、ブランチやタグの削除、送り先にあるタグを動かすこと
 #
 # ハブには研究の中身（論旨、文字起こし、指導教員の未発表の考え）が入っているため（1、2）。
 # コミットの説明が履歴の正本なので、送った履歴を消さないため（3。CLAUDE.md の「履歴を書き換えない」）。
@@ -54,6 +54,18 @@ while read -r local_ref local_sha remote_ref remote_sha; do
   case "$remote_sha" in
     *[!0]*) ;;
     *) continue ;;  # 送り先に無い参照（新しいブランチやタグ）
+  esac
+
+  # タグは、先のコミットへ進めることも含めて動かさない（見せた版の印なので）
+  case "$remote_ref" in
+    refs/tags/*)
+      if [ "$remote_sha" != "$local_sha" ]; then
+        echo "止めました：送り先にある $remote_ref を、別のコミットに動かそうとしています（$remote）。" >&2
+        echo "タグは見せた版などの印なので動かしません。別の名前のタグを付けてください。" >&2
+        exit 1
+      fi
+      continue
+      ;;
   esac
 
   if ! git cat-file -e "$remote_sha^{commit}" 2>/dev/null; then
