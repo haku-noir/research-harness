@@ -86,7 +86,7 @@ Hub-Session: <会話の ID（あれば）>
 |---|---|---|
 | `hub/state.md`、`workstreams.md`、`decisions.md`、`briefs/` | 統括 | 読むだけ |
 | `hub/reports/<id>.md` | その作業の会話 | 統括は読むだけ |
-| `hub/glossary.md` | だれでも（追記。出典を付ける） | ― |
+| `hub/glossary.md` | 統括（出典を付ける）。作業の会話は、報告の「用語集に足すもの」に候補を書く | 読むだけ |
 | `hub/rules.md`、`profile.md`、`roles/`、`templates/` | 統括（研究者の指示で） | 読むだけ |
 | `hub/research.md`（研究の全体像） | 統括（研究者の指示で。論旨の作業からは提案として受ける） | 読むだけ |
 | `papers/<論文の id>/`（論文ごとの論旨） | 論旨の作業の会話（無ければ統括）。書き終えた論文は読み出しのみ | 読むだけ |
