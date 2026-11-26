@@ -54,9 +54,13 @@ def clean(content) -> str:
     t = REMINDER_RX.sub("", t).strip()
     if not t or "This session is being continued" in t[:300]:
         return ""
-    if "<command-name>" in t:  # スラッシュコマンド：名前と引数を残す
+    if "<command-name>" in t:
+        # スラッシュコマンド：引数のあるものだけを、名前と引数で残す。
+        # 引数の無いもの（/clear、/exit、/model など）は、研究者の発言として数えない
         name = re.search(r"<command-name>(.*?)</command-name>", t, re.S)
         args = re.search(r"<command-args>(.*?)</command-args>", t, re.S)
+        if not (args and args.group(1).strip()):
+            return ""
         return " ".join(x.group(1).strip() for x in (name, args) if x and x.group(1).strip())
     if t.startswith(SKIP_PREFIXES):
         return ""
