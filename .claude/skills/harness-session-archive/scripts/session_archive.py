@@ -20,7 +20,9 @@
   python -X utf8 session_archive.py --list     （対象の会話を一覧するだけ）
 """
 import argparse
+import hashlib
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -33,14 +35,17 @@ OUT = HUB / "records" / "sessions"
 RAW = OUT / "raw"
 DIGEST = RAW / "digest"
 CACHE = RAW / ".index.json"
+CACHE_VERSION = 2  # 読み方を変えたら上げる。上がると、すべての会話を一度読み直す
 SOURCES = HUB / "hub" / "session-sources.txt"
 PROJECTS = Path.home() / ".claude" / "projects"
 TRAILER = "Hub-Session"
 
+REMINDER_RX = re.compile(r"<system-reminder>.*?</system-reminder>", re.S)
 SKIP_PREFIXES = (
-    "<system-reminder", "<local-command", "<command-", "<side-sessions", "<task-notification",
+    "<system-reminder", "<local-command", "<side-sessions", "<task-notification",
     "[Request interrupted", "<ci-monitor-event", "<user-prompt-submit-hook",
 )
+CHORE_RX = re.compile(r"^chore\((sessions|links)\)!?:")
 SECRET = [
     (re.compile(r"[\w.+-]+@[\w-]+\.[\w.-]+"), "<メールアドレス>"),
     (re.compile(r"\b(sk-ant-[\w-]{10,}|sk-[\w-]{20,}|ghp_\w{20,}|github_pat_\w{20,}|xox[abpr]-[\w-]{10,})"), "<秘密の値>"),
@@ -65,12 +70,15 @@ def load_sources():
     dirs, excludes = [], []
     if not SOURCES.exists():
         return [str(HUB)], []
-    for line in SOURCES.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
+    # BOM 付きでも読めるように utf-8-sig。行の途中の「 #」より後は注釈として読み飛ばす
+    for line in SOURCES.read_text(encoding="utf-8-sig").splitlines():
+        line = re.split(r"\s#", line, maxsplit=1)[0].strip()
         if not line or line.startswith("#"):
             continue
         if line.startswith("!"):
-            excludes.append(line[1:].strip())
+            x = line[1:].strip()
+            if x:  # 「!」だけの行で、すべての会話を除いてしまわないように
+                excludes.append(x)
         else:
             dirs.append(line)
     if str(HUB) not in dirs:
@@ -86,25 +94,39 @@ def local(ts):
 
 
 def candidate_files(dirs):
-    files = []
-    if not PROJECTS.exists():
-        return files
-    encs = [encode(d) for d in dirs]
-    for p in PROJECTS.iterdir():
-        if p.is_dir() and any(p.name == e or p.name.startswith(e + "-") for e in encs):
-            files += list(p.glob("*.jsonl"))
-    return files
+    """会話のファイル。Claude Code のフォルダにあるものを優先し、消えたもの（既定で 30 日）はハブに写した生の記録を使う。"""
+    files = {}
+    if PROJECTS.exists():
+        encs = [encode(d).lower() for d in dirs]  # Windows ではフォルダの名前の大文字・小文字がそろわないことがある
+        for p in PROJECTS.iterdir():
+            n = p.name.lower()
+            if p.is_dir() and any(n == e or n.startswith(e + "-") for e in encs):
+                for f in p.glob("*.jsonl"):
+                    files[f.stem] = f
+    if RAW.exists():
+        for f in RAW.glob("*.jsonl"):
+            files.setdefault(f.stem, f)
+    return list(files.values())
+
+
+def message_text(content):
+    if isinstance(content, list):
+        return " ".join(x.get("text", "") for x in content if isinstance(x, dict) and x.get("type") == "text")
+    return content if isinstance(content, str) else ""
 
 
 def user_text(content):
-    if isinstance(content, list):
-        t = " ".join(x.get("text", "") for x in content if isinstance(x, dict) and x.get("type") == "text")
-    else:
-        t = content or ""
-    t = t.strip()
-    if not t or t.startswith(SKIP_PREFIXES):
+    """研究者の発言の本文。先に <system-reminder> の囲みを除いてから、機械が足した行かを判定する。"""
+    t = REMINDER_RX.sub("", message_text(content)).strip()
+    if not t:
         return ""
-    return re.sub(r"<system-reminder>.*?</system-reminder>", "", t, flags=re.S).strip()
+    if "<command-name>" in t:  # スラッシュコマンド：コマンドの名前と引数を残す
+        name = re.search(r"<command-name>(.*?)</command-name>", t, re.S)
+        args = re.search(r"<command-args>(.*?)</command-args>", t, re.S)
+        return " ".join(x.group(1).strip() for x in (name, args) if x and x.group(1).strip())
+    if t.startswith(SKIP_PREFIXES):
+        return ""
+    return t
 
 
 def one_line(s, n=120):
@@ -156,6 +178,18 @@ def parse(path: Path):
                 title_a = d["aiTitle"]
             if d.get("cwd") and not cwd:
                 cwd = d["cwd"]
+            if typ == "attachment" and not d.get("isSidechain"):
+                # Claude が作業している間に研究者が送った発言。ほかの会話（peer）や作業の知らせは除く
+                a = d.get("attachment") or {}
+                origin = (a.get("origin") or {}).get("kind")
+                if (a.get("type") == "queued_command" and a.get("commandMode") == "prompt"
+                        and not a.get("isMeta") and origin in (None, "human")):
+                    t = user_text(a.get("prompt"))
+                    if t:
+                        items.append({"uuid": d.get("uuid"), "label": d.get("sessionId") or sid, "kind": "user",
+                                      "ts": d.get("timestamp") or a.get("timestamp"), "text": t, "queued": True})
+                        cur = None
+                continue
             if d.get("isSidechain") or typ not in ("user", "assistant"):
                 continue
             ts, uuid, label = d.get("timestamp"), d.get("uuid"), d.get("sessionId") or sid
@@ -192,6 +226,7 @@ def parse(path: Path):
                     if cur is None:
                         cur = {"uuid": uuid, "label": label, "kind": "claude", "ts": ts, "text": [], "tools": []}
                         items.append(cur)
+                    cur["te"] = ts or cur.get("te")  # 返答が続いた最後の時刻（期間と、要約が要るかの判定に使う）
                     if b["type"] == "text" and b.get("text", "").strip():
                         cur["text"].append(b["text"].strip())
                     elif b["type"] == "tool_use":
@@ -202,9 +237,13 @@ def parse(path: Path):
         if it["kind"] == "claude":
             it["text"] = "\n\n".join(it["text"])
     items = [it for it in items if it["kind"] != "claude" or it["text"] or it["tools"]]
+    # 作業中に送った発言は、あとで普通の発言としても記録されることがある。同じ本文があれば、その方を残す
+    said = {re.sub(r"\s+", " ", i["text"]).strip() for i in items if i["kind"] == "user" and not i.get("queued")}
+    items = [i for i in items if not (i.get("queued") and re.sub(r"\s+", " ", i["text"]).strip() in said)]
     title = title_c or title_a or next((one_line(i["text"], 40) for i in items if i["kind"] == "user"), sid[:8])
+    times = [local(i.get("te") or i["ts"]) for i in items]
     first = next((local(i["ts"]) for i in items if local(i["ts"])), None)
-    last = next((local(i["ts"]) for i in reversed(items) if local(i["ts"])), None)
+    last = max((t for t in times if t), default=None)
     return {"id": sid, "cwd": cwd, "title": title, "items": items, "first": first, "last": last}
 
 
@@ -226,23 +265,24 @@ def quote(md: str) -> str:
 def hub_commit_map():
     """会話の ID → その会話のハブのコミット（「短い ID 日付 件名」）。git log は 1 回だけ起動する。"""
     try:
-        r = subprocess.run(["git", "-C", str(HUB), "log", "--all", "--date=short",
-                            "--format=%x1e%h %ad %s%x1f%B"],
-                           capture_output=True, text=True, encoding="utf-8", timeout=60)
-    except (OSError, subprocess.SubprocessError):
+        # git の出力の文字コードの設定（i18n.logOutputEncoding）によらず UTF-8 で受け取る
+        r = subprocess.run(["git", "-c", "i18n.logOutputEncoding=UTF-8", "-C", str(HUB), "log", "--all",
+                            "--date=short", "--format=%x1e%h %ad%x1f%s%x1f%B"],
+                           capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=60)
+    except (OSError, subprocess.SubprocessError, ValueError):
         return {}
     found = {}
     trailer_rx = re.compile(rf"^{TRAILER}:\s*(\S+)\s*$", re.M)
-    for rec in r.stdout.split("\x1e"):
-        if "\x1f" not in rec:
+    for rec in (r.stdout or "").split("\x1e"):
+        parts = rec.split("\x1f", 2)
+        if len(parts) < 3:
             continue
-        head, body = rec.split("\x1f", 1)
-        head = head.strip()
+        head, subject, body = parts[0].strip(), parts[1].strip(), parts[2]
         # 会話の記録だけを更新するコミット（chore(sessions):）は載せない。載せると記録の更新が終わらないため
-        if " chore(sessions):" in head or " chore(links):" in head:
+        if CHORE_RX.match(subject):
             continue
         for sid in trailer_rx.findall(body):
-            found.setdefault(sid, []).append(head)
+            found.setdefault(sid, []).append(f"{head} {subject}")
     return found
 
 
@@ -310,7 +350,7 @@ def auto_block(s, r, parent, commits):
     if r["first"] and r["last"]:
         L.append(f"- 期間：{r['first']:%Y-%m-%d %H:%M} 〜 {r['last']:%Y-%m-%d %H:%M}")
     if parent:
-        L.append(f"- 分岐元：[{parent['title']}]({parent['file']})")
+        L.append(f"- 分岐元：[{redact(parent['title'])}]({parent['file']})")
     L += [f"- 生の記録：`records/sessions/raw/{s['id']}.jsonl`（git の外。この PC だけ）",
           f"- 読める形：`records/sessions/raw/digest/{s['id']}.md`（git の外）"]
     if commits:
@@ -321,8 +361,31 @@ def auto_block(s, r, parent, commits):
 
 
 def summarized_until(text):
-    m = re.search(r"^- 要約した範囲：.*?(\d{4}-\d{2}-\d{2} \d{2}:\d{2})", text, re.M)
-    return m.group(1) if m else None
+    m = re.search(r"^- 要約した範囲：.*?(\d{4}-\d{2}-\d{2}) (\d{1,2}):(\d{2})", text, re.M)
+    return f"{m.group(1)} {int(m.group(2)):02d}:{m.group(3)}" if m else None
+
+
+def is_linked_worktree():
+    """ハブのワークツリー（.claude/worktrees/ など）の中で動いているか。そのときは何も書かない。
+    そこで開いた会話は、元のハブで動くときに、ハブの下の会話として取り込まれる。"""
+    return (HUB / ".git").is_file()
+
+
+def write_text(path: Path, text: str):
+    """改行は LF にそろえ、一時ファイルに書いてから入れ替える（途中で止まっても壊れたファイルを残さない）。"""
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(text, encoding="utf-8", newline="\n")
+    os.replace(tmp, path)
+
+
+def load_cache():
+    try:
+        c = json.loads(CACHE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}  # 無い、または壊れている：すべてを読み直す
+    if not isinstance(c, dict) or c.get("_v") != CACHE_VERSION:
+        return {}
+    return c
 
 
 def main():
@@ -340,11 +403,14 @@ def main():
             pass
     if not (HUB / "hub").exists():
         return  # 導入前のひな形では何もしない
+    if is_linked_worktree():
+        return
     dirs, excludes = load_sources()
     roots = [norm(d) for d in dirs]
     for d in (OUT, RAW, DIGEST):
         d.mkdir(parents=True, exist_ok=True)
-    cache = json.loads(CACHE.read_text(encoding="utf-8")) if CACHE.exists() else {}
+    cache = load_cache()
+    raw_dir = RAW.resolve()
 
     def in_scope(cwd):
         if not cwd:
@@ -378,10 +444,13 @@ def main():
             continue
         entry = {"key": key, "title": p["title"], "cwd": p["cwd"],
                  "uuids": [i["uuid"] for i in p["items"]], "labels": [i["label"] for i in p["items"]],
-                 "ts": [i["ts"] for i in p["items"]], "changed": True}
+                 "kinds": [i["kind"] for i in p["items"]], "ts": [i["ts"] for i in p["items"]],
+                 "te": [i.get("te") or i["ts"] for i in p["items"]], "changed": True}
         cache[sid] = entry
         sessions.append({"id": sid, "path": f, "parsed": p, **entry})
-        shutil.copy2(f, RAW / f.name)
+        # 生の記録をハブに写す（一覧だけのときと、すでにハブの写しから読んだときは写さない）
+        if not a.list and f.resolve().parent != raw_dir:
+            shutil.copy2(f, RAW / f.name)
 
     # 各発言の持ち主：発言に記された会話がその発言を持っていればその会話、無ければ最も早い会話
     def first_ts(s):
@@ -399,11 +468,15 @@ def main():
     rows = {}
     for s in sessions:
         own = [i for i, u in enumerate(s["uuids"]) if owner.get(u) == s["id"]]
+        te, kinds = s.get("te") or s["ts"], s.get("kinds") or [""] * len(s["ts"])
         ts_own = sorted(s["ts"][i] for i in own if s["ts"][i])
+        te_own = sorted(te[i] for i in own if te[i])
+        talk_own = sorted(s["ts"][i] for i in own if s["ts"][i] and kinds[i] in ("user", "answer"))
         first = local(ts_own[0]) if ts_own else None
-        last = local(ts_own[-1]) if ts_own else None
+        last = local(te_own[-1]) if te_own else None
         s["own_idx"] = own
         rows[s["id"]] = {"id": s["id"], "title": s.get("title", ""), "first": first, "last": last,
+                         "last_talk": local(talk_own[-1]) if talk_own else None,
                          "cwd": s.get("cwd"), "n_own": len(own),
                          "file": (f"{first:%Y-%m-%d}_{s['id'][:8]}.md" if first else None)}
 
@@ -431,11 +504,15 @@ def main():
             cache[s["id"]].pop("changed", None)
             continue
         dg = DIGEST / f"{s['id']}.md"
-        if s.get("changed") or not dg.exists():
+        # 読める形は、会話のファイルが変わったときだけでなく、持ち主の決まり方（分岐元）が変わったときにも作り直す
+        own_sig = hashlib.sha1(("\n".join(s["uuids"][i] or "" for i in s["own_idx"]) + "|" +
+                                (parent["file"] if parent else "")).encode("utf-8")).hexdigest()
+        if s.get("changed") or not dg.exists() or cache[s["id"]].get("own_sig") != own_sig:
             p = s["parsed"] or parse(s["path"])
             own_set = {s["uuids"][i] for i in s["own_idx"]}
             items = [i for i in p["items"] if i["uuid"] in own_set]
-            dg.write_text(render_digest(p, items, parent["title"] if parent else None), encoding="utf-8")
+            write_text(dg, render_digest(p, items, parent["title"] if parent else None))
+            cache[s["id"]]["own_sig"] = own_sig
         # 要約のファイル：名前が変わっていたら移す（中身は Claude が書いたものなので消さない）
         out = OUT / r["file"]
         if not out.exists():
@@ -453,10 +530,12 @@ def main():
         else:
             new = f"# 会話の要約：{redact(r['title'])}\n\n{block}\n{summary_body()}"
         if not out.exists() or out.read_text(encoding="utf-8") != new:
-            out.write_text(new, encoding="utf-8")
+            write_text(out, new)
         until = summarized_until(new)
         r["until"] = until
-        r["pending"] = (until is None) or (r["last"] is not None and f"{r['last']:%Y-%m-%d %H:%M}" > until)
+        # 要約が要るのは、要約した範囲の後に研究者の発言があるとき（Claude の最後の返答だけでは要らない）
+        lt = r["last_talk"]
+        r["pending"] = (until is None) or (lt is not None and f"{lt:%Y-%m-%d %H:%M}" > until)
         cache[s["id"]].pop("changed", None)
 
     rows_l = [rows[s["id"]] for s in sessions]
@@ -478,13 +557,14 @@ def main():
             link = f"自分の発言なし。中身は [{par['file']}]({par['file']})" if par else "自分の発言なし"
             state = "―"
         idx.append(f"| {when} | {title} | `{r['id'][:8]}` | {link} | {state} |")
-    (OUT / "README.md").write_text("\n".join(idx) + "\n", encoding="utf-8")
-    CACHE.write_text(json.dumps(cache, ensure_ascii=False), encoding="utf-8")
+    write_text(OUT / "README.md", "\n".join(idx) + "\n")
+    cache["_v"] = CACHE_VERSION
+    write_text(CACHE, json.dumps(cache, ensure_ascii=False))
     pend = [r for r in rows_l if r.get("pending")]
     if a.pending:
         for r in pend:
             print(f"{r['id'][:8]}  要約：records/sessions/{r['file']}  読める形：records/sessions/raw/digest/{r['id']}.md  "
-                  f"要約した範囲：{r.get('until') or 'なし'}  最後の発言：{r['last']:%Y-%m-%d %H:%M}")
+                  f"要約した範囲：{r.get('until') or 'なし'}  最後の発言：{(r['last_talk'] or r['last']):%Y-%m-%d %H:%M}")
     elif not a.hook:
         print(f"会話 {len(rows_l)} 件を更新した。要約が要る会話：{len(pend)} 件（--pending で一覧）")
 
