@@ -71,30 +71,57 @@ def mask_code(text: str) -> str:
 
 
 HEAD_LINE_RX = re.compile(rf"^{re.escape(HEAD)}[ \t]*$", re.M)
+# このスクリプトが囲みの中に書く行の形（「- 相談：…」など）
+GENERATED_LINE_RX = re.compile(r"^- (?:%s)：|^- （まだ無い）[ \t]*$" % "|".join(map(re.escape, KIND_ORDER)))
+
+
+def looks_generated(lines) -> bool:
+    return all(GENERATED_LINE_RX.match(ln) for ln in lines if ln.strip())
 
 
 def find_block(text: str):
-    """末尾の自動の囲みを探す。戻り値：(見出しの始まり, 囲みの始まり, 囲みの終わり)、None（まだ無い）、"broken"（崩れている）。
-    本当の囲みは、見出しのすぐ後にある、最後の始まりの印だけ。本文やコードの中で印に触れても、囲みとみなさない
-    （最初の印を囲みとみなすと、そこから後ろの本文を消してしまうため）。"""
+    """自動の囲みを探す。戻り値：(見出しの始まり, 囲みの始まり, 囲みの終わり)、None（まだ無い）、"broken"（崩れている）。
+    囲みとみなすのは、次をすべて満たすものだけ（最後のものを採る）。
+    - コードの外にある
+    - 見出しのすぐ後に、始まりの印がある
+    - 終わりの印までの中身が、このスクリプトの書く形の行だけ
+    本文で印に触れた所や、本文に書いた囲みの例は、囲みとみなさない（置き換えると本文を消してしまうため）。
+    スクリプトが書いた行が残っているのに印の組が欠けているときは、崩れているとして書き込まない。"""
     t = mask_code(text)
     for m in reversed(list(START_RX.finditer(t))):
         heads = [h for h in HEAD_LINE_RX.finditer(t, 0, m.start())]
-        if heads and not t[heads[-1].end():m.start()].strip():
-            j = t.find(END, m.end())
-            return "broken" if j < 0 else (heads[-1].start(), m.start(), j + len(END))
-    # 見出しだけが残っている（始まりの印が消えた）。足すと見出しが二つになるので、崩れているとする
-    return "broken" if HEAD_LINE_RX.search(t) else None
+        if not heads or t[heads[-1].end():m.start()].strip():
+            continue
+        j = t.find(END, m.end())
+        if j < 0:
+            # 終わりの印が無い。すぐ後ろがスクリプトの書いた行なら、崩れた囲み。そうでなければ本文
+            after = [ln for ln in text[m.end():].splitlines() if ln.strip()][:1]
+            if after and looks_generated(after):
+                return "broken"
+            continue
+        if looks_generated(text[m.end():j].splitlines()):
+            return heads[-1].start(), m.start(), j + len(END)
+    # 始まりの印が消えた囲み：見出しのすぐ後ろに、スクリプトの書いた行か終わりの印がある
+    for h in HEAD_LINE_RX.finditer(t):
+        after = [ln for ln in text[h.end():].splitlines() if ln.strip()][:1]
+        if after and (after[0].strip() == END or looks_generated(after)):
+            return "broken"
+    return None
 
 
 def strip_generated(text: str) -> str:
-    """自動で書いた囲み（このスクリプトの逆向きのリンク）を読み飛ばす。"""
+    """自動で書いた囲み（このスクリプトの逆向きのリンク）を読み飛ばす。崩れた囲みでは、スクリプトの書いた行だけを読み飛ばす。"""
     b = find_block(text)
     if b is None:
         return text
     if b == "broken":
+        # 最後の見出しより後ろの、スクリプトの書いた行と印だけを読み飛ばす（その前の「関連」の欄は、同じ形でも本文）
         heads = list(HEAD_LINE_RX.finditer(mask_code(text)))
-        return text[:heads[-1].start()] if heads else text
+        if not heads:
+            return text
+        tail = [ln for ln in text[heads[-1].end():].splitlines()
+                if not (GENERATED_LINE_RX.match(ln) or START_RX.fullmatch(ln.strip()) or ln.strip() == END)]
+        return text[:heads[-1].start()] + "\n".join(tail)
     return text[:b[0]] + text[b[2]:]
 
 
