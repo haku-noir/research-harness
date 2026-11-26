@@ -18,7 +18,9 @@
 
 ## 2. 最初に読むもの
 
-1. `<hub>/harness/roles/common.md` と `<hub>/harness/roles/{{役}}.md`（`<hub>/hub/roles/{{役}}.md` があればその後に）
+（レビューの作業は、この 1〜2 を読まず、`<hub>/harness/roles/review.md` の「起動と読むもの」に従う）
+
+1. `<hub>/harness/roles/common.md` と `<hub>/harness/roles/{{役}}.md`（試行なら `trial.md` と、確かめる内容の種類の手引きの両方。`<hub>/hub/roles/{{役}}.md` があればその後に）
 2. `<hub>/hub/state.md`、`<hub>/harness/base-rules.md`、`<hub>/hub/rules.md`、`<hub>/hub/profile.md`（ハブの外で動くときは `<hub>/CLAUDE.md` も）
 3. この作業に要るもの（写さずに場所で示す）：
    - {{論旨の節}}
@@ -44,7 +46,7 @@
 
 ## 7. 守ること
 
-- コミット：{{頼まれたときだけ / ブランチ `<名前>` に機能ごと}}
+- コードのリポジトリへのコミット：{{頼まれたときだけ / ブランチ `<名前>` に機能ごと / 作業の場所がハブなら不要（ハブには区切りごとにコミットする）}}
 - 秘密：{{公開のリポジトリなら、論旨や文字起こしの内容を書かない、など}}
 - 他の作業との重なり：{{同じファイルを触る作業があれば、その id}}
 

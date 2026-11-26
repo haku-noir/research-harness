@@ -23,6 +23,9 @@ Thumbs.db
 # 会話の生の記録（JSONL）、要約のための読める形（digest/）、キャッシュ。会話の要約 records/sessions/*.md は git に入れる
 records/sessions/raw/
 
+# ハブのワークツリー（論旨を大きく変えるときなど。共通の手引きの「コミットする」）
+.claude/worktrees/
+
 # Claude Code の、この PC だけの設定（研究ごとの skillOverrides など。hub/rules.md にも書いておく）
 .claude/settings.local.json
 

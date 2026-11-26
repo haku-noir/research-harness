@@ -93,11 +93,11 @@ Hub-Session: <会話の ID（あれば）>
 | ほかの AI の読み替えのファイル（例：`hub/codex.md`） | その AI | 読むだけ |
 | `hub/research.md`（研究の全体像） | 統括（研究者の指示で。論旨の作業からは提案として受ける） | 読むだけ |
 | `papers/<論文の id>/`（論文ごとの論旨） | 論旨の作業の会話（無ければ統括）。書き終えた論文は読み出しのみ | 読むだけ |
-| `chats/` | 文字起こしを直す会話 | 読むだけ |
+| `chats/` | 文字起こしを直す会話。冒頭の「相談の記録」の行は、統括も直してよい | 読むだけ |
 | `records/meetings/` | 統括（`harness-meeting-record`） | 読むだけ |
 | `records/history/` | 統括（`harness-install`、`harness-progress-timeline`） | 読むだけ |
 | `records/experiments/<id>/` | 作るのは統括（`harness-dispatch`）。書き足すのは、その実験の実装・解析の作業の会話 | 読むだけ |
-| `records/sessions/`（会話の要約） | 要約の本文は Claude（作業の会話は自分の会話、統括はほかの会話）。冒頭の `auto` の囲みと一覧はスクリプト。作業の会話は、自分の要約を報告と一緒にコミットしてよい。囲みと一覧だけの更新は、統括が `chore(sessions):` でコミットする | 読むだけ |
+| `records/sessions/`（会話の要約） | 要約の本文は Claude（作業の会話は自分の会話、統括はほかの会話。統括も、決定を書いたときは自分の会話の「決まったこと」を書く）。冒頭の `auto` の囲みと一覧はスクリプト。作業の会話は、自分の要約を報告と一緒にコミットしてよい。囲みと一覧だけの更新は、統括が `chore(sessions):` でコミットする | 読むだけ |
 | `records/links.md`、`chats/README.md`、各記録の末尾の「この記録を指しているもの（自動）」 | `harness-record-links`（スクリプト）。人も Claude も直接書き換えない | 読むだけ |
 | `literature/index.md`（参照の一覧。原文と抜き書きは git の外） | 文献の作業の会話（追記） | 読むだけ |
 | `slides/` | 発表の作業の会話 | 読むだけ |

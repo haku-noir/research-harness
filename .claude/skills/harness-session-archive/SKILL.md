@@ -31,6 +31,8 @@ description: 研究に関係する Claude Code の会話を研究ハブに残す
 
 ## スクリプト（自動・手動）
 
+ハブのワークツリーやハブの外から動かすときは、元のハブのパス（`<hub>/.claude/skills/…`）で動かす。
+
 ```
 python -X utf8 .claude/skills/harness-session-archive/scripts/session_archive.py            （更新）
 python -X utf8 .claude/skills/harness-session-archive/scripts/session_archive.py --pending  （更新して、要約が要る会話を出す）
@@ -55,6 +57,8 @@ python -X utf8 .claude/skills/harness-session-archive/scripts/session_archive.py
 - **統括**：次の二つのときに、`--pending` に出た会話を要約する。いま動いている作業セッションの会話は、その作業セッションに任せる。
   - 統括として始めたとき
   - 報告を受けたとき（`harness-dispatch` の 6）
+
+**要約しない会話**：研究者が要約しないと決めた会話（研究と関係が薄い、過去の会話のうち主なもの以外など）は、要約のファイルの「要約した範囲」の行を「- 要約した範囲：要約しない（理由）」にする。生の記録は残り、「要約が要る」の一覧に出なくなる。
 
 **書き方**（要約のファイルの `auto` の囲みの下を書く。囲みの中は書き換えない）。要約のひな形は `harness/templates/session-summary.md`。研究の層の `hub/templates/session-summary.md` があれば、スクリプトはそちらで新しい要約を作る：
 
