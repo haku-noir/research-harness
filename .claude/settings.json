@@ -1,0 +1,17 @@
+{
+  "hooks": {
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "shell": "bash",
+            "command": "PY=$(command -v python || command -v python3); [ -n \"$PY\" ] && { \"$PY\" -X utf8 \"$CLAUDE_PROJECT_DIR/.claude/skills/harness-session-archive/scripts/session_archive.py\" --hook; \"$PY\" -X utf8 \"$CLAUDE_PROJECT_DIR/.claude/skills/harness-record-links/scripts/record_links.py\" --hook; } || true",
+            "timeout": 180,
+            "statusMessage": "会話と記録のリンクをハブに残しています"
+          }
+        ]
+      }
+    ]
+  }
+}

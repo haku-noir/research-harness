@@ -1,0 +1,27 @@
+# 確認用の資料の出力は作り直せるので git に入れない（見せたものは records/meetings/ に写して残す）
+papers/*/export/
+
+# 生の文字起こし（修正済みは chats/ に置く）。残すかは hub/profile.md で決める
+chats/raw/
+
+# 実験のデータは git の外に置く。records/experiments/<id>/ には所在だけを書く
+records/experiments/*/data/
+
+# 作業用
+.venv/
+__pycache__/
+*.pyc
+.DS_Store
+Thumbs.db
+
+# 文献の原文と抜き書きは git に入れない（他の人の著作のため）。
+# literature/ で git に入れるのは、案内（README.md）と参照の一覧（index.md）だけ
+/literature/*
+!/literature/README.md
+!/literature/index.md
+
+# 会話の生の記録（JSONL）の控え。読める形は records/sessions/*.md として git に入れる
+records/sessions/raw/
+
+# ==== この研究で足したもの ====
+# ここより上はひな形の持ち物（ひな形の更新で入れ替わる）。研究で git から外したいものは、この下に、理由のコメントを付けて足す。

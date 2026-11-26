@@ -1,0 +1,72 @@
+#!/bin/sh
+# 研究ハブの git から外への push を止める。
+# 導入（INSTALL.md）で `git config core.hooksPath harness/hooks` として有効にする。
+#
+# 止めるもの：
+#   1. ひな形のリポジトリへの push（リモート名 template、またはその URL を直接指定したもの）
+#   2. 許可していないリモートへの push（許可は git config の hub.pushAllowed に、リモート名で書く）
+#   3. 許可したリモートでも、履歴を書き換える push（force push）と、ブランチやタグの削除
+#
+# ハブには研究の中身（論旨、文字起こし、指導教員の未発表の考え）が入っているため（1、2）。
+# コミットの説明が履歴の正本なので、送った履歴を消さないため（3。CLAUDE.md の「履歴を書き換えない」）。
+
+remote="$1"
+url="$2"
+
+template_url=$(git config --get remote.template.url 2>/dev/null)
+
+if [ -n "$template_url" ]; then
+  if [ "$remote" = "template" ] || [ "$url" = "$template_url" ] || [ "$remote" = "$template_url" ]; then
+    echo "止めました：研究ハブを、ひな形のリポジトリ（$template_url）に push しようとしています。" >&2
+    echo "ハブには研究の中身が入っています。ひな形を直すときは、ひな形を別の場所に複製し、そこで直してください（README.md の「ひな形を直すとき」）。" >&2
+    exit 1
+  fi
+fi
+
+allowed_remote=""
+for allowed in $(git config --get-all hub.pushAllowed 2>/dev/null); do
+  if [ "$remote" = "$allowed" ]; then
+    allowed_remote="yes"
+  fi
+done
+
+if [ -z "$allowed_remote" ]; then
+  echo "止めました：研究ハブの push 先として許可していないリモートです（$remote：$url）。" >&2
+  echo "ハブは、手元だけか、非公開のリモートにだけ置きます。" >&2
+  echo "そのリモートが非公開であることを研究者が確かめたら、研究者が次を実行すると許可されます：" >&2
+  echo "  git config --add hub.pushAllowed $remote" >&2
+  exit 1
+fi
+
+# 送る内容は、1 行に 1 つずつ「手元の参照 手元のコミット 送り先の参照 送り先のコミット」で渡される。
+while read -r local_ref local_sha remote_ref remote_sha; do
+  [ -z "$local_ref" ] && continue
+
+  case "$local_sha" in
+    *[!0]*) ;;
+    *)
+      echo "止めました：送り先の $remote_ref を消そうとしています（$remote）。" >&2
+      echo "ハブの履歴は消しません（CLAUDE.md の「履歴を書き換えない」）。消す必要があれば、研究者が決めて自分で行ってください。" >&2
+      exit 1
+      ;;
+  esac
+
+  case "$remote_sha" in
+    *[!0]*) ;;
+    *) continue ;;  # 送り先に無い参照（新しいブランチやタグ）
+  esac
+
+  if ! git cat-file -e "$remote_sha^{commit}" 2>/dev/null; then
+    echo "止めました：送り先の $remote_ref に、手元に無いコミットがあります（$remote）。" >&2
+    echo "このまま送ると、そのコミットを消すおそれがあります。先に git fetch $remote で取り込み、手元に合わせてから送ってください。" >&2
+    exit 1
+  fi
+
+  if ! git merge-base --is-ancestor "$remote_sha" "$local_sha" 2>/dev/null; then
+    echo "止めました：送り先の $remote_ref の履歴を書き換える push です（force push。$remote）。" >&2
+    echo "ハブの履歴は書き換えません（CLAUDE.md の「履歴を書き換えない」）。送り先の変更を取り込んでから、もう一度送ってください。" >&2
+    exit 1
+  fi
+done
+
+exit 0
