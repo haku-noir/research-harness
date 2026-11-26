@@ -78,7 +78,11 @@ def load_sources():
     if not SOURCES.exists():
         return [str(HUB)], []
     # BOM 付きでも読めるように utf-8-sig。行の途中の「 #」より後は注釈として読み飛ばす
-    for line in SOURCES.read_text(encoding="utf-8-sig").splitlines():
+    try:
+        src = SOURCES.read_text(encoding="utf-8-sig")
+    except UnicodeDecodeError:  # 別の文字コードで保存された（説明の行が化けても、パスの行は読める）
+        src = SOURCES.read_text(encoding="utf-8", errors="replace")
+    for line in src.splitlines():
         line = re.split(r"\s#", line, maxsplit=1)[0].strip()
         if not line or line.startswith("#"):
             continue
@@ -367,11 +371,20 @@ SUMMARY_BODY = """
 """
 
 
+def read_or_none(path: Path):
+    """UTF-8 で読む。読めない（UTF-8 でない、開けない）ときは None。1 つのファイルのせいで全体を止めないため。"""
+    try:
+        return path.read_text(encoding="utf-8-sig")
+    except (OSError, UnicodeDecodeError):
+        return None
+
+
 def summary_body():
     """要約のひな形。研究の層（hub/templates/session-summary.md）があればそちらを使う。"""
     for c in (HUB / "hub" / "templates" / "session-summary.md", HUB / "harness" / "templates" / "session-summary.md"):
-        if c.exists():
-            return "\n" + c.read_text(encoding="utf-8").lstrip("\n")
+        t = read_or_none(c) if c.exists() else None
+        if t is not None:
+            return "\n" + t.lstrip("\n")
     return SUMMARY_BODY
 
 
@@ -656,6 +669,7 @@ def main():
     commits_of = hub_commit_map()
     git_ok = commits_of is not None
     commits_of = commits_of or {}
+    skipped = []  # 読めなかった・書けなかった要約のファイル
     for s in sessions:
         keep_lock()
         r = rows[s["id"]]
@@ -689,8 +703,15 @@ def main():
             if olds:
                 olds[0].rename(out)
         block = auto_block(s, r, parent, commits_of.get(s["id"], []))
+        text = None
         if out.exists():
-            text = out.read_text(encoding="utf-8")
+            text = read_or_none(out)
+            if text is None:
+                # 読めない要約（UTF-8 でない、開けない）は書き換えず、ほかの会話を続ける
+                skipped.append(r["file"])
+                r["until"], r["pending"] = "読めない（UTF-8 で保存し直す）", False
+                cache[s["id"]].pop("changed", None)
+                continue
             m = AUTO_START_RX.search(text)
             e = AUTO_END_RX.search(text, m.end()) if m else None
             if m and e and git_ok:
@@ -699,8 +720,14 @@ def main():
                 new = text  # 囲みが無い・崩れている、または git が動かず、ハブのコミットの一覧が作れない
         else:
             new = f"# 会話の要約：{no_marker(redact(r['title']))}\n\n{block}\n{summary_body()}"
-        if not out.exists() or out.read_text(encoding="utf-8") != new:
-            write_text(out, new)
+        if new != text:
+            try:
+                write_text(out, new)
+            except OSError:
+                # 書けない（ほかのプログラムが開いているなど）ときも、ほかの会話を続ける。次の実行でやり直す
+                skipped.append(r["file"])
+                r["until"], r["pending"] = "書けなかった（次の実行でやり直す）", False
+                continue
         if NOT_SUMMARIZED_RX.search(new):
             r["until"], r["pending"] = "要約しない", False
             cache[s["id"]].pop("changed", None)
@@ -717,11 +744,12 @@ def main():
     known8 = {k[:8] for k in cache if k != "_v"} | {s["id"][:8] for s in sessions}
     if (OUT / "README.md").exists():
         row_rx = re.compile(r"^\| (?P<when>[^|]*) \|.*\| `(?P<id>[0-9a-f]{8})` \| \[(?P<file>[^\]]+)\]\(")
-        for line in (OUT / "README.md").read_text(encoding="utf-8").splitlines():
+        for line in (read_or_none(OUT / "README.md") or "").splitlines():
             m = row_rx.match(line)
             # この PC が知らない会話（別の PC で開いた会話、生の記録がこの PC に無い会話）だけを残す。
             # この PC が知っていて対象の外にした会話（除いた、場所を外した）は残さない
-            if m and m.group("id") not in known8 and (OUT / m.group("file")).exists():
+            if (m and m.group("id") not in known8 and (OUT / m.group("file")).exists()
+                    and not any(m.group("id").startswith(x[:8]) for x in excludes)):
                 kept.append((m.group("when").strip(), line))
     idx = ["# 会話の記録", "",
            "研究に関係する Claude Code の会話の要約。**履歴の記録**なので、書かれた決定はその時点のもの（現在の決定は `hub/decisions.md`）。",
@@ -756,6 +784,10 @@ def main():
                   f"要約した範囲：{r.get('until') or 'なし'}  最後の発言：{(r['last_talk'] or r['last']):%Y-%m-%d %H:%M}")
     elif not a.hook:
         print(f"会話 {len(rows_l)} 件を更新した。要約が要る会話：{len(pend)} 件（--pending で一覧）")
+    if skipped and not a.hook:
+        print("次の要約のファイルは、読めない（UTF-8 でない、開けない）か書けなかったので、触っていない：")
+        for f in skipped:
+            print(f"  records/sessions/{f}")
     if not git_ok and not a.hook:
         print("git が動かなかったので、要約の冒頭の囲み（ハブのコミットの一覧など）は書き換えなかった")
 

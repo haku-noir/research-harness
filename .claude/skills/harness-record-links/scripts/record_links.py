@@ -99,8 +99,13 @@ def find_block(text: str):
             if after and looks_generated(after):
                 return "broken"
             continue
-        if looks_generated(text[m.end():j].splitlines()):
+        inner = [ln for ln in text[m.end():j].splitlines() if ln.strip()]
+        if looks_generated(inner):
             return heads[-1].start(), m.start(), j + len(END)
+        if any(GENERATED_LINE_RX.match(ln) for ln in inner):
+            # スクリプトの書いた行に、人の書いた行が混ざっている（囲みの中に書き足した）。
+            # 置き換えると人の行が消え、本文とみなすと逆向きのリンクをこの記録のリンクと数えてしまうので、触らずに知らせる
+            return "broken"
     # 始まりの印が消えた囲み：見出しのすぐ後ろに、スクリプトの書いた行か終わりの印がある
     for h in HEAD_LINE_RX.finditer(t):
         after = [ln for ln in text[h.end():].splitlines() if ln.strip()][:1]
