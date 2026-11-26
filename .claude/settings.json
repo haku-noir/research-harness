@@ -6,7 +6,7 @@
           {
             "type": "command",
             "shell": "bash",
-            "command": "PY=; for c in python python3 'py -3'; do if $c -c 'import sys; sys.exit(sys.version_info < (3, 8))' >/dev/null 2>&1; then PY=$c; break; fi; done; [ -n \"$PY\" ] && { $PY -X utf8 \"$CLAUDE_PROJECT_DIR/.claude/skills/harness-session-archive/scripts/session_archive.py\" --hook; $PY -X utf8 \"$CLAUDE_PROJECT_DIR/.claude/skills/harness-record-links/scripts/record_links.py\" --hook; } || true",
+            "command": "PY=; for c in python python3 'py -3'; do if $c -c 'import sys; sys.exit(sys.version_info < (3, 10))' >/dev/null 2>&1; then PY=$c; break; fi; done; [ -n \"$PY\" ] && { $PY -X utf8 \"$CLAUDE_PROJECT_DIR/.claude/skills/harness-session-archive/scripts/session_archive.py\" --hook; $PY -X utf8 \"$CLAUDE_PROJECT_DIR/.claude/skills/harness-record-links/scripts/record_links.py\" --hook; } || true",
             "timeout": 180,
             "statusMessage": "会話と記録のリンクをハブに残しています"
           }
