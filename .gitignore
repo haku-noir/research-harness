@@ -11,6 +11,9 @@ records/experiments/*/data/
 .venv/
 __pycache__/
 *.pyc
+# スクリプトのロック（.git/ が無いとき）と、止められた書き込みが残した一時ファイル
+records/.hub-scripts.lock
+.*.tmp
 .DS_Store
 Thumbs.db
 

@@ -2,7 +2,9 @@
 
 書くのは、各記録の「関連」の欄（その記録から先へのリンク）だけ（その記録を書いた会話の Claude が書く）。このスクリプトがそこから作る：
 
-- 各記録の末尾の「この記録を指しているもの（自動）」の囲み（<!-- links:start --> 〜 <!-- links:end -->）
+- 各記録の末尾の「この記録を指しているもの（自動）」の囲み（<!-- links:start --> 〜 <!-- links:end -->）。
+  囲みとみなすのは、その見出しのすぐ後の最後の印だけ。本文やコードの中で印に触れても、囲みとはみなさない。
+  見出しと印の組が崩れていれば、書き込まずに知らせる
 - records/links.md：記録ごとに「指しているもの」「指されているもの」。切れたリンクも出す
 - chats/README.md：文字起こしの一覧と、それぞれを使った相談・会話・決定など
 
@@ -12,7 +14,7 @@
 - 相談の記録：フォルダ名（例：2026-01-15_第2章の草稿）
 - 実験の記録：実験の id（例：exp-pilot）
 - 会話の要約：ファイル名か、会話の ID の先頭 8 文字（例：1a2b3c4d）
-- 決定：hub/decisions.md
+- 決定：hub/decisions.md（パスで書く。名前だけの「decisions.md」は、ひな形などと取り違えるので数えない）
 - 研究の全体像、論文ごとの論旨、導入前の経緯などの記録、指示書・報告：パス
 - 名前の前後は区切られている必要がある（「ゼミ」で「ゼミ_続き」や「第2回ゼミ」を拾わないため）
 
@@ -38,7 +40,9 @@ from pathlib import Path
 from urllib.parse import unquote
 
 HUB = Path(__file__).resolve().parents[4]
-LOCK = HUB / "records" / ".links.lock"
+# 会話の記録のスクリプトと共有するロック。git の中（.git/）に置く（git に入らず、目にも触れない）
+LOCK = (HUB / ".git" / "hub-scripts.lock") if (HUB / ".git").is_dir() else (HUB / "records" / ".hub-scripts.lock")
+STALE_SEC = 180  # これより古いロックは、止められた実行が残したものとして外す（フックの上限 180 秒に合わせる）
 # 会話の要約の「決まったこと」などの印（同じ秒が重なったときの -2 なども）
 ANCHOR_ID_RX = re.compile(r"^[a-z]{1,3}-\d{8}-\d{6}(?:-\d+)?$")
 LINK_RX = re.compile(r"\]\((<[^>\n]+>|[^)\s]+)\)")
@@ -60,16 +64,38 @@ def rel(p: Path) -> str:
     return p.relative_to(HUB).as_posix()
 
 
+def mask_code(text: str) -> str:
+    """コードの中（``` の囲みと `…`）を、同じ長さの空白に置き換える（位置を保ったまま、コードの中を探さないため）。"""
+    t = FENCE_RX.sub(lambda m: re.sub(r"[^\n]", " ", m.group(0)), text)
+    return INLINE_CODE_RX.sub(lambda m: " " * len(m.group(0)), t)
+
+
+HEAD_LINE_RX = re.compile(rf"^{re.escape(HEAD)}[ \t]*$", re.M)
+
+
+def find_block(text: str):
+    """末尾の自動の囲みを探す。戻り値：(見出しの始まり, 囲みの始まり, 囲みの終わり)、None（まだ無い）、"broken"（崩れている）。
+    本当の囲みは、見出しのすぐ後にある、最後の始まりの印だけ。本文やコードの中で印に触れても、囲みとみなさない
+    （最初の印を囲みとみなすと、そこから後ろの本文を消してしまうため）。"""
+    t = mask_code(text)
+    for m in reversed(list(START_RX.finditer(t))):
+        heads = [h for h in HEAD_LINE_RX.finditer(t, 0, m.start())]
+        if heads and not t[heads[-1].end():m.start()].strip():
+            j = t.find(END, m.end())
+            return "broken" if j < 0 else (heads[-1].start(), m.start(), j + len(END))
+    # 見出しだけが残っている（始まりの印が消えた）。足すと見出しが二つになるので、崩れているとする
+    return "broken" if HEAD_LINE_RX.search(t) else None
+
+
 def strip_generated(text: str) -> str:
     """自動で書いた囲み（このスクリプトの逆向きのリンク）を読み飛ばす。"""
-    m = START_RX.search(text)
-    if not m:
+    b = find_block(text)
+    if b is None:
         return text
-    i = m.start()
-    j = text.find(END, i)
-    head_i = text.rfind(HEAD, 0, i)
-    cut_from = head_i if head_i >= 0 and text[head_i:i].strip() == HEAD else i
-    return text[:cut_from] + (text[j + len(END):] if j >= 0 else "")
+    if b == "broken":
+        heads = list(HEAD_LINE_RX.finditer(mask_code(text)))
+        return text[:heads[-1].start()] if heads else text
+    return text[:b[0]] + text[b[2]:]
 
 
 def collect_nodes():
@@ -92,7 +118,7 @@ def collect_nodes():
         add(p, "経緯", [p.name], p.stem, True)
     dec = HUB / "hub" / "decisions.md"
     if dec.exists():
-        add(dec, "決定", ["hub/decisions.md", "decisions.md"], "hub/decisions.md", True)
+        add(dec, "決定", ["hub/decisions.md"], "hub/decisions.md", True)
     for sub in ("briefs", "reports"):
         for p in sorted((HUB / "hub" / sub).glob("*.md")):
             add(p, "指示書・報告", [f"hub/{sub}/{p.name}"], f"{sub}/{p.stem}", False)
@@ -209,14 +235,30 @@ def main_hub_of_worktree():
         r = subprocess.run(["git", "-C", str(HUB), "rev-parse", "--absolute-git-dir", "--git-common-dir"],
                            capture_output=True, text=True, timeout=10)
     except (OSError, subprocess.SubprocessError):
-        return None
+        return main_hub_by_git_file()
     lines = r.stdout.split("\n")
     if r.returncode != 0 or len(lines) < 2 or not lines[1].strip():
-        return None
+        return main_hub_by_git_file()
     git_dir = Path(lines[0].strip()).resolve()
     common = Path(lines[1].strip())
     common = (common if common.is_absolute() else HUB / common).resolve()
     return common.parent if git_dir != common else None
+
+
+def main_hub_by_git_file():
+    """git が動かないとき：ワークツリーでは .git がファイル（gitdir: <元>/.git/worktrees/<名前>）。分からなければ、何も書かない側に倒す。"""
+    g = HUB / ".git"
+    if not g.is_file():
+        return None
+    try:
+        line = g.read_text(encoding="utf-8").strip()
+    except OSError:
+        return HUB
+    if not line.startswith("gitdir:"):
+        return HUB
+    gd = Path(line.split(":", 1)[1].strip())
+    gd = (gd if gd.is_absolute() else HUB / gd).resolve()
+    return gd.parents[2] if gd.parent.name == "worktrees" and len(gd.parents) > 2 else HUB
 
 
 def replace(tmp, path):
@@ -231,7 +273,8 @@ def replace(tmp, path):
 
 
 def acquire_lock(wait=120):
-    """同時に動いた別の会話のフックと、順番に動くためのロック。止まった実行が残したもの（10 分より古い）は外す。"""
+    """同時に動いた別の会話のフックや、会話の記録のスクリプトと、順番に動くためのロック。
+    止められた実行が残したもの（STALE_SEC より古い）は外す。"""
     LOCK.parent.mkdir(parents=True, exist_ok=True)
     deadline = time.time() + wait
     while True:
@@ -243,7 +286,7 @@ def acquire_lock(wait=120):
             return True
         except FileExistsError:
             try:
-                if time.time() - LOCK.stat().st_mtime > 600:
+                if time.time() - LOCK.stat().st_mtime > STALE_SEC:
                     LOCK.unlink(missing_ok=True)
                     continue
             except OSError:
@@ -274,7 +317,8 @@ def main():
                   f"  python -X utf8 \"{main_hub / '.claude/skills/harness-record-links/scripts/record_links.py'}\" "
                   + " ".join(x for x in sys.argv[1:] if x != "--hook"))
         return
-    if not check and not acquire_lock():
+    # フックからは長く待たない（持ち時間が短いため）。どちらのスクリプトも毎回すべてを作り直すので、次の実行で追いつく
+    if not check and not acquire_lock(20 if hook else 120):
         if not hook:
             print(f"ほかの実行が終わらないので、何もしない（{LOCK} が残っていれば、動いている実行が無いことを確かめて消す）")
         return
@@ -295,12 +339,15 @@ def main():
             broken.append((src, f"{dst}#{a}", "印が無い"))
 
     missing = []  # 先が無いリンク（あとで、git に入れない場所のものを除く）
+    broken_blocks = []  # 末尾の囲みが崩れている記録（書き込まない）
     sources = [n for n, v in nodes.items() if v["kind"] != "文字起こし"]
     for src in sources:
         sp = nodes[src]["path"]
         raw_text = read(sp)
         if raw_text is None:
             continue  # 開けなかった（読めなかったファイルとして知らせる）
+        if nodes[src]["inject"] and find_block(raw_text) == "broken":
+            broken_blocks.append(src)
         text = strip_generated(raw_text)
         for dst, anchors in find_keys(text, keys).items():
             if dst == src:
@@ -383,6 +430,10 @@ def main():
             print(f"読めなかったファイル（UTF-8 でない、または開けない）：{len(set(unreadable))}")
             for n in sorted(set(unreadable)):
                 print("  ", n)
+        if broken_blocks:
+            print(f"末尾の囲みが崩れている記録（書き込まない）：{len(broken_blocks)}")
+            for n in broken_blocks:
+                print("  ", n)
         return
 
     def write(p: Path, text: str):
@@ -419,7 +470,7 @@ def main():
 
     # 各記録の末尾に、指しているもの
     for n, v in nodes.items():
-        if not v["inject"] or rel(v["path"]) in GENERATED or rel(v["path"]) in unreadable:
+        if not v["inject"] or rel(v["path"]) in GENERATED or rel(v["path"]) in unreadable or n in broken_blocks:
             continue  # 読めなかったファイルには書き込まない（字を置き換えたまま書き戻さないため）
         p = v["path"]
         text = read(p)
@@ -428,10 +479,13 @@ def main():
         items = [(s, a) for s, a in in_edges[n].items()]
         body = grouped(items, p.parent, True) or ["- （まだ無い）"]
         block = "\n".join([START, *body, END])
-        m = START_RX.search(text)
-        if m and END in text[m.end():]:
-            i, j = m.start(), text.index(END, m.end()) + len(END)
-            new = text[:i] + block + text[j:]
+        b = find_block(text)
+        if b == "broken":
+            if n not in broken_blocks:
+                broken_blocks.append(n)  # 読んだ後に崩れた
+            continue
+        if b:
+            new = text[:b[1]] + block + text[b[2]:]
         else:
             new = text.rstrip("\n") + f"\n\n{HEAD}\n\n{block}\n"
         if new != text:
@@ -450,6 +504,11 @@ def main():
               "UTF-8 でないファイルは字を置き換えて読んだので、リンクを取りこぼしているかもしれない（UTF-8 で保存し直す）。"
               "開けなかったファイルは読んでいない。どちらにも、逆向きのリンクは書き込んでいない。", ""]
         L += [f"- `{n}`" for n in sorted(set(unreadable))] + [""]
+    if broken_blocks:
+        L += ["## 末尾の囲みが崩れている記録", "",
+              "末尾の「この記録を指しているもの（自動）」の見出しと囲みの印（始まりと終わり）の組が崩れているので、書き込んでいない。"
+              "見出しから囲みの終わりまでを消せば、次に作り直したときに新しく足される。", ""]
+        L += [f"- `{n}`" for n in broken_blocks] + [""]
     if unlinked:
         L += ["## 相談の記録につながっていない文字起こし", "",
               "どの相談の記録にも書かれていない文字起こし。`harness-meeting-record` でつなぐ。相談ではないものは、文字起こしの冒頭の「相談の記録」の行を「なし」にする。", ""]
@@ -487,7 +546,7 @@ def main():
         n_edges = sum(len(d) for d in out_edges.values())
         print(f"記録 {len(nodes)} 件、リンク {n_edges} 本。切れたリンク {len(broken)} 件、"
               f"相談の記録につながっていない文字起こし {len(unlinked)} 件、"
-              f"読めなかったファイル {len(set(unreadable))} 件（records/links.md）")
+              f"読めなかったファイル {len(set(unreadable))} 件、囲みが崩れている記録 {len(broken_blocks)} 件（records/links.md）")
 
 
 if __name__ == "__main__":
