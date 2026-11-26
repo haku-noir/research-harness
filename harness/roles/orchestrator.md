@@ -10,6 +10,7 @@
   - `git config core.hooksPath` が `harness/hooks`
   - `git config remote.template.pushurl` が無効な値（`no-push-to-template`）
   - `harness/hooks/pre-push` がある
+- **導入の続きがあるか。** `hub/workstreams.md` に種類「導入」の行が残っていれば、導入の段 2 の途中。研究者に、次の項目から続けるかを聞く（`harness-install` の「導入の 2 段」）。
 - **要約が要る会話があるか。** `harness-session-archive` のスクリプトを `--pending` で動かし、出た会話を要約する（いま動いている作業の会話は除く）。
 - **作業の会話の状態**：`hub/workstreams.md` の「セッション」の欄にある会話が、研究者の答えを待っていないか、終わっていないかを確かめる（確かめる道具があれば）。統括を替えた後は、前の統括に届いた知らせがこちらには届かないため。
 - **統括は同時に一つだけ。** 統括の会話を同時に二つ動かすと、両方が `hub/state.md` などを書き換えて食い違う。`hub/workstreams.md` と研究者の言葉から、ほかに動いている統括が無いかを確かめる。あれば、どちらで続けるかを研究者に聞く。
