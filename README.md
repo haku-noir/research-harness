@@ -52,7 +52,7 @@ Claude が [INSTALL.md](INSTALL.md) に従い、次のことを質問しなが�
 
 ```
 （ひな形の仕組み：更新を取り込む部分）
-CLAUDE.md                 全セッション共通の約束。統括役の仕事
+CLAUDE.md                 全セッション共通の約束
 AGENTS.md                 Claude Code 以外の AI の入口（数行。導入と読み替えへの案内）
 INSTALL.md                導入の手順（Claude が従う）
 .claude/skills/harness-*  仕組みのスキル（研究ごとに変えない）

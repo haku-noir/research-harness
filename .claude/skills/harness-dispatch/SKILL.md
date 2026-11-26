@@ -27,7 +27,7 @@ description: 統括役が作業を別のセッションに切り出す。指示�
 | 解析 | `harness/roles/analysis.md` | 解析のリポジトリかディレクトリ |
 | 発表 | `harness/roles/slides.md` | ハブ（`slides/`） |
 | 試行 | `harness/roles/trial.md` と、確かめる内容の種類の手引き | 試行のブランチ、または下書きの場所 |
-| レビュー | `harness/roles/review.md` | 読むだけ（見る対象の場所は指示書に書く） |
+| レビュー | `harness/roles/review.md` | ハブの外の、何も無いフォルダ（`hub/profile.md` の「場所」。無ければ研究者に聞いて作る）。読むだけで、見る対象の場所は指示書に書く |
 
 - **id を付ける。** `<種類>-<短い名前>`（`hub/workstreams.md` の例を見る）。
 - **担う AI を決める。** 研究者が別の AI を指定しなければ、統括と同じ AI。`hub/profile.md` の「使う AI」の表に無い AI なら、指示書を書く前に研究者に聞く（`CLAUDE.md` の「ハブを公開しない」）。初めて作業させる AI なら、起動の文に「先に `<hub>/harness/other-ai.md` の「初めて作業の会話として使われたとき」を読む」を添える。
