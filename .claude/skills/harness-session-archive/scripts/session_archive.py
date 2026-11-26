@@ -656,7 +656,8 @@ UNREADABLE_STATE = "読めない（UTF-8 で保存し直す）"
 def other_rows(sessions, excludes, seen8, skipped):
     """一覧の、いまの会話以外の行（並べる鍵, 行）。records/sessions/ にある要約のファイルの全部を載せる。
     別の PC で開いた会話など、この PC で対象の会話に無いもの。除いた会話（「! <ID>」）は載せない。
-    前の一覧に行があればそれを使い（開始の時刻と題が分かるため）、無ければファイルから作る（一覧が消えても作り直せるように）。
+    前の一覧に行があれば、開始の時刻と題はそれを使い（この PC では分からないため）、無ければファイルから作る（一覧が消えても作り直せるように）。
+    要約した範囲の欄は、いつもファイルから決め直す（別の PC で要約したなど、ファイルが変わっていることがあるため）。
     この PC では要約が要るかを決められないので、「要約が要る」の印は付けない。"""
     cur8 = {s["id"][:8] for s in sessions}
     prev = {}
@@ -664,7 +665,9 @@ def other_rows(sessions, excludes, seen8, skipped):
     for line in ((read_or_none(idx) or "").splitlines() if idx.exists() else []):
         m = ROW_RX.match(line)
         if m and UNREADABLE_STATE not in line:  # 読めなかった行は、ファイルから作り直す（直っているかもしれないため）
-            prev.setdefault(m.group("file"), (m.group("when").strip(), line.replace("（**要約が要る**）", "")))
+            # 最後の欄（要約した範囲）を除いた部分。欄の中に「|」は無い（題の「|」は「／」に置き換えてある）
+            head = line.rstrip().rstrip("|").rstrip()
+            prev.setdefault(m.group("file"), (m.group("when").strip(), head[: head.rindex("|")]))
     out = []
     for p in sorted(OUT.glob("*.md")):
         m = SUMMARY_FILE_RX.match(p.name)
@@ -673,19 +676,20 @@ def other_rows(sessions, excludes, seen8, skipped):
         day, id8 = m.groups()
         if id8 in cur8 or any(id8.startswith(x[:8]) for x in excludes):
             continue
-        if p.name in prev:
-            out.append(prev[p.name])
-            continue
         note = "（この PC では対象の外の会話）" if id8 in seen8 else "（この PC に会話の記録なし）"
         text = read_or_none(p)
         if text is None:
             skipped.append((p.name, "読めない（UTF-8 でない、開けない）"))
             out.append((day, f"| {day} | （読めない）{note} | `{id8}` | [{p.name}]({p.name}) | {UNREADABLE_STATE} |"))
             continue
+        state = "要約しない" if NOT_SUMMARIZED_RX.search(text) else (summarized_until(text) or "未要約")
+        if p.name in prev:
+            when, head = prev[p.name]
+            out.append((when, f"{head}| {state} |"))
+            continue
         head = text.split("\n", 1)[0].strip()
         title = head[len("# 会話の要約："):] if head.startswith("# 会話の要約：") else ""
         title = one_line(title.strip() or p.stem, 200).replace("|", "／")
-        state = "要約しない" if NOT_SUMMARIZED_RX.search(text) else (summarized_until(text) or "未要約")
         out.append((day, f"| {day} | {title}{note} | `{id8}` | [{p.name}]({p.name}) | {state} |"))
     return out
 

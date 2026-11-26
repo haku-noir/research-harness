@@ -45,7 +45,7 @@ HUB = Path(__file__).resolve().parents[4]
 # 会話の記録のスクリプトと共有するロック。git の中（.git/）に置く（git に入らず、目にも触れない）
 LOCK = (HUB / ".git" / "hub-scripts.lock") if (HUB / ".git").is_dir() else (HUB / "records" / ".hub-scripts.lock")
 # これより古いロックは、止められた実行が残したものとして外す。会話の終わりのフックは 60 秒ほどで止められ、
-# 会話の記録のスクリプトは長く動くあいだ 20 秒ごとにロックの時刻を新しくするので、これより古いものは確かに止まっている
+# 手で動かした長い実行は（どちらのスクリプトも）20 秒ごとにロックの時刻を新しくする（keep_lock）ので、これより古いものは確かに止まっている
 STALE_SEC = 90
 # 会話の要約の「決まったこと」などの印（同じ秒が重なったときの -2 なども）
 ANCHOR_ID_RX = re.compile(r"^[a-z]{1,3}-\d{8}-\d{6}(?:-\d+)?$")
@@ -369,7 +369,7 @@ def replace(tmp, path):
 
 def acquire_lock(wait=120):
     """同時に動いた別の会話のフックや、会話の記録のスクリプトと、順番に動くためのロック。
-    止められた実行が残したもの（STALE_SEC より古い）は外す。"""
+    止められた実行が残したもの（STALE_SEC より古い）は外す。長く動くあいだは keep_lock で時刻を新しくする。"""
     LOCK.parent.mkdir(parents=True, exist_ok=True)
     deadline = time.time() + wait
     while True:
@@ -389,6 +389,20 @@ def acquire_lock(wait=120):
             if time.time() > deadline:
                 return False
             time.sleep(0.2)
+
+
+_last_touch = [0.0]
+
+
+def keep_lock():
+    """長く動くとき（記録の多いハブを手で作り直すとき）、ロックが古いものと見なされないように、ときどき時刻を新しくする。"""
+    now = time.time()
+    if now - _last_touch[0] > 20:
+        try:
+            os.utime(LOCK)
+        except OSError:
+            pass
+        _last_touch[0] = now
 
 
 def link_to(src_dir: Path, dst: Path, anchor=None) -> str:
@@ -437,6 +451,8 @@ def main():
     broken_blocks = []  # 末尾の囲みが崩れている記録（書き込まない）
     sources = [n for n, v in nodes.items() if v["kind"] != "文字起こし"]
     for src in sources:
+        if not check:  # --check ではロックを取らない
+            keep_lock()
         sp = nodes[src]["path"]
         raw_text = read(sp)
         if raw_text is None:
@@ -565,6 +581,7 @@ def main():
 
     # 各記録の末尾に、指しているもの
     for n, v in nodes.items():
+        keep_lock()
         if not v["inject"] or rel(v["path"]) in GENERATED or rel(v["path"]) in unreadable or n in broken_blocks:
             continue  # 読めなかったファイルには書き込まない（字を置き換えたまま書き戻さないため）
         p = v["path"]

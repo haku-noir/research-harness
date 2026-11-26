@@ -100,7 +100,7 @@ Hub-Session: <会話の ID（あれば）>
 | `records/meetings/` | 統括（`harness-meeting-record`） | 読むだけ |
 | `records/history/` | 統括（`harness-install`、`harness-progress-timeline`） | 読むだけ |
 | `records/experiments/<id>/` | 作るのは統括（`harness-dispatch`）。書き足すのは、その実験の実装・解析の作業の会話 | 読むだけ |
-| `records/sessions/`（会話の要約） | 要約の本文は Claude（作業の会話は自分の会話、統括はほかの会話。統括も、決定を書いたときは自分の会話の「決まったこと」を書く）。冒頭の `auto` の囲みと一覧はスクリプト。作業の会話は、自分の要約を報告と一緒にコミットしてよい。囲みと一覧だけの更新は、統括が `chore(sessions):` でコミットする | 読むだけ |
+| `records/sessions/`（会話の要約） | 要約の本文は Claude（作業の会話は自分の会話、統括はほかの会話。統括も、決定を書いたときは自分の会話の「決まったこと」を書く）。冒頭の `auto` の囲みと一覧はスクリプト。自分の会話の要約は、報告や決定と一緒にふつうのコミットで入れる。囲みと一覧の自動の更新と、統括がほかの会話の要約を書いた・足したものは、統括が `chore(sessions):` でコミットする | 読むだけ |
 | `records/links.md`、`chats/README.md`、各記録の末尾の「この記録を指しているもの（自動）」 | `harness-record-links`（スクリプト）。人も Claude も直接書き換えない | 読むだけ |
 | `literature/index.md`（参照の一覧。原文と抜き書きは git の外） | 文献の作業の会話（追記） | 読むだけ |
 | `slides/` | 発表の作業の会話 | 読むだけ |
