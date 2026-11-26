@@ -20,8 +20,11 @@ Thumbs.db
 !/literature/README.md
 !/literature/index.md
 
-# 会話の生の記録（JSONL）の控え。読める形は records/sessions/*.md として git に入れる
+# 会話の生の記録（JSONL）、要約のための読める形（digest/）、キャッシュ。会話の要約 records/sessions/*.md は git に入れる
 records/sessions/raw/
+
+# Claude Code の、この PC だけの設定（研究ごとの skillOverrides など。hub/rules.md にも書いておく）
+.claude/settings.local.json
 
 # ==== この研究で足したもの ====
 # ここより上はひな形の持ち物（ひな形の更新で入れ替わる）。研究で git から外したいものは、この下に、理由のコメントを付けて足す。

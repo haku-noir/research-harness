@@ -15,4 +15,4 @@
 
 ## 発表の後
 
-- 発表での質疑や議事録は、統括に渡す（`base-transcript-fix` で `chats/` に記録する）。統括が `records/meetings/` に「見せたもの＋反応」として記録する。
+- 発表での質疑や議事録は、統括に渡す（文字起こしのスキルで `chats/` に記録する）。統括が `harness-meeting-record` で相談の記録につなぐ。

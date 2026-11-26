@@ -31,7 +31,7 @@ Claude Code 以外の AI で導入するときは、先に `harness/other-ai.md`
    git config core.hooksPath harness/hooks
    ```
 
-   入ったことを確かめる。`git push --dry-run template HEAD` が失敗すればよい。
+   入ったことを確かめる。`git push --dry-run template HEAD` が失敗し、`git config core.hooksPath` が `harness/hooks` を返せばよい。
    - push 先を無効にしたので、ひな形には送れない。
    - `harness/hooks/pre-push` が、許可していないリモートへの push を止める。許可は `git config --add hub.pushAllowed <リモート名>` で足す。研究者が、そのリモートが非公開であることを確かめてから、研究者自身が行う。
    - 許可したリモートでも、履歴を書き換える push（force push）と、ブランチやタグの削除は止まる（`CLAUDE.md` の「履歴を書き換えない」）。
@@ -104,7 +104,7 @@ python -X utf8 .claude/skills/harness-record-links/scripts/record_links.py --che
 
 ### ひな形が持つファイル
 
-- `CLAUDE.md`、`AGENTS.md`、`INSTALL.md`、`README.md`
+- `CLAUDE.md`、`AGENTS.md`、`INSTALL.md`、`README.md`、`LICENSE`
 - `.claude/settings.json`
 - `.claude/skills/harness-*`（仕組みのスキル）と `.claude/skills/base-*`（見本のスキル）
 - `harness/`

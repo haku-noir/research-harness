@@ -109,7 +109,7 @@ python -X utf8 .claude/skills/harness-session-archive/scripts/session_archive.py
 2. **決定に会話を付ける。** `hub/decisions.md` の決定の「会話」の欄に、要約の「決まったこと」の印へのリンクを書く。
 
    ```
-   - 会話：records/sessions/2026-01-10_1a2b3c4d.md#d-20260115-143000
+   - 会話：../records/sessions/2026-01-10_1a2b3c4d.md#d-20260115-143000（`hub/decisions.md` からの相対リンク）
    ```
 
    決めた言葉そのものは、要約の uuid で生の記録（または読める形）を探して確かめる。

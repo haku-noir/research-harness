@@ -31,7 +31,7 @@
 
 - **ひな形のリポジトリ（リモート `template`）には、何も push しない。**
 - **ハブの push は、研究者の指示があるときだけ行う。** 送り先は、許可したリモート（`git config --get-all hub.pushAllowed`）だけ。ハブの git は手元だけか非公開のリモートに置く。
-- **守りの設定を、研究者に無断で変えない。** 次の操作は研究者が自分で行う。研究者に頼まれても、送り先が非公開であることを研究者が確かめたことを先に確かめる。
+- **守りの設定を、研究者に無断で弱めない。** 守りを入れる・入れ直す操作（`INSTALL.md` の 1-3）は Claude が行ってよい。守りを弱める次の操作は、研究者が自分で行う。研究者に頼まれても、送り先が非公開であることを研究者が確かめたことを先に確かめる。
   - push の許可を足す（`hub.pushAllowed`）、push 先の URL を変える、フックを外す（`core.hooksPath`）、`--no-verify` で push する
 - **ひな形を直すときは、ハブの中で直さない。** ひな形を別の場所に複製し、そこで直す（README の「ひな形を直すとき」）。ハブの中の仕組みのファイルを直した場合は、その変更をひな形の複製に写す。
 - **公開のコードのリポジトリにも、ハブの中身を書かない。** ファイルにも、コミットの説明にも書かない。
@@ -71,6 +71,7 @@ Hub-Session: <会話の ID（あれば）>
 - **`Hub-Agent:` は必ず付ける**（Claude でも）。どの AI の作業かを、履歴から分かるようにするため。
 - `Hub-Model:` と `Hub-Effort:` は、分かれば付ける。Claude Code では、モデルは Claude が知っている自分のモデルの名前、エフォートは環境変数 `CLAUDE_EFFORT` の値。
 - `Hub-Session:` は、その AI に会話の ID があれば付ける（Claude Code では環境変数 `CLAUDE_CODE_SESSION_ID`）。会話の要約とコミットを互いにたどれるようにするため。
+- **例外**：会話の記録や記録どうしのリンクの、自動の更新だけのコミット（件名が `chore(sessions):`・`chore(links):`）には、`Hub-Session:` を付けない（`Hub-Agent:` は付ける）。付けると、会話の要約のコミットの一覧が更新のたびに変わり、更新が終わらないため。
 
 **履歴を書き換えない**：作ったコミットを消したり書き換えたりしない。
 
@@ -87,14 +88,16 @@ Hub-Session: <会話の ID（あれば）>
 | `hub/state.md`、`workstreams.md`、`decisions.md`、`briefs/` | 統括 | 読むだけ |
 | `hub/reports/<id>.md` | その作業の会話 | 統括は読むだけ |
 | `hub/glossary.md` | 統括（出典を付ける）。作業の会話は、報告の「用語集に足すもの」に候補を書く | 読むだけ |
-| `hub/rules.md`、`profile.md`、`roles/`、`templates/` | 統括（研究者の指示で） | 読むだけ |
+| `hub/rules.md`、`profile.md`、`roles/`、`templates/` | 統括（研究者の指示で）。ただし `profile.md` の「使う AI」の表は、研究者の許可を受けた会話の AI が 1 行足してよい | 読むだけ |
+| `hub/session-sources.txt`（会話の記録の対象） | 統括 | 読むだけ |
+| ほかの AI の読み替えのファイル（例：`hub/codex.md`） | その AI | 読むだけ |
 | `hub/research.md`（研究の全体像） | 統括（研究者の指示で。論旨の作業からは提案として受ける） | 読むだけ |
 | `papers/<論文の id>/`（論文ごとの論旨） | 論旨の作業の会話（無ければ統括）。書き終えた論文は読み出しのみ | 読むだけ |
 | `chats/` | 文字起こしを直す会話 | 読むだけ |
 | `records/meetings/` | 統括（`harness-meeting-record`） | 読むだけ |
 | `records/history/` | 統括（`harness-install`、`harness-progress-timeline`） | 読むだけ |
-| `records/experiments/<id>/` | その実験の実装・解析の作業の会話 | 読むだけ |
-| `records/sessions/`（会話の要約） | 要約の本文は Claude（作業の会話は自分の会話、統括はほかの会話）。冒頭の `auto` の囲みと一覧はスクリプト。コミットは統括 | 読むだけ |
+| `records/experiments/<id>/` | 作るのは統括（`harness-dispatch`）。書き足すのは、その実験の実装・解析の作業の会話 | 読むだけ |
+| `records/sessions/`（会話の要約） | 要約の本文は Claude（作業の会話は自分の会話、統括はほかの会話）。冒頭の `auto` の囲みと一覧はスクリプト。作業の会話は、自分の要約を報告と一緒にコミットしてよい。囲みと一覧だけの更新は、統括が `chore(sessions):` でコミットする | 読むだけ |
 | `records/links.md`、`chats/README.md`、各記録の末尾の「この記録を指しているもの（自動）」 | `harness-record-links`（スクリプト）。人も Claude も直接書き換えない | 読むだけ |
 | `literature/index.md`（参照の一覧。原文と抜き書きは git の外） | 文献の作業の会話（追記） | 読むだけ |
 | `slides/` | 発表の作業の会話 | 読むだけ |
@@ -116,6 +119,6 @@ Hub-Session: <会話の ID（あれば）>
 ## スキルとひな形の層
 
 - **スキルは、頼まれた内容に合うものを説明文で選ぶ。** 見本のスキル（`base-`）は、`hub/rules.md` に、この研究で代わりに使うスキルが書いてあればそちらを使う。仕組みのスキル（`harness-`）は置き換えない。
-- **ひな形の層は書き換えない。** `CLAUDE.md`、`AGENTS.md`、`INSTALL.md`、`README.md`、`harness/`、`.claude/skills/harness-*`、`.claude/skills/base-*`、`.claude/settings.json`、`.gitattributes`、`.gitignore`（末尾の「この研究で足したもの」より上）。研究に合わせて直すときは研究の層に書く。手順と、仕組みが読む部分（研究の層で差し替えても残すもの）は README の「研究に合わせて直す」。
+- **ひな形の層は書き換えない。** `CLAUDE.md`、`AGENTS.md`、`INSTALL.md`、`README.md`、`LICENSE`、`harness/`、`.claude/skills/harness-*`、`.claude/skills/base-*`、`.claude/settings.json`、`.gitattributes`、`.gitignore`（末尾の「この研究で足したもの」より上）。研究に合わせて直すときは研究の層に書く。手順と、仕組みが読む部分（研究の層で差し替えても残すもの）は README の「研究に合わせて直す」。
 - **上書きできないもの**：このファイルの約束と、仕組みのスキル。研究の層に書いても無効で、変えたいときはひな形そのものを直す。
 - **ひな形の更新**：「ひな形に更新はある？」「ひな形の更新を取り込んで」と頼まれたら、`INSTALL.md` の 2 に従う。頼まれないのに、更新を探したり取り込んだりしない。
