@@ -14,7 +14,13 @@
 - 会話の要約：ファイル名か、会話の ID の先頭 8 文字（例：1a2b3c4d）
 - 決定：hub/decisions.md
 - 研究の全体像、論文ごとの論旨、導入前の経緯などの記録、指示書・報告：パス
-- 「パス#印」と書かれていれば、印まで記録し、印が無ければ切れたリンクとして出す
+- 名前の前後は区切られている必要がある（「ゼミ」で「ゼミ_続き」や「第2回ゼミ」を拾わないため）
+
+切れたリンク：
+
+- Markdown のリンク（[…](先) と [ ](<先>)）の先を、その記録のフォルダから（無ければハブから）たどり、無ければ出す
+- 印（#d-20260115-143000 の形）が、先の記録に <a id="…"></a> として無ければ出す。見出しへの印は確かめない
+- git の外のもの（records/sessions/raw/、export/）、URL、「*」「{{」を含むものは確かめない
 
 使い方:
   python -X utf8 record_links.py          （作り直す）
@@ -25,8 +31,14 @@ import os
 import re
 import sys
 from pathlib import Path
+from urllib.parse import unquote
 
 HUB = Path(__file__).resolve().parents[4]
+ANCHOR_ID_RX = re.compile(r"^[a-z]{1,3}-\d{8}-\d{6}$")  # 会話の要約の「決まったこと」などの印
+LINK_RX = re.compile(r"\]\((<[^>\n]+>|[^)\s]+)\)")
+TAIL_RX = re.compile(r"(?:/README\.md)?(?:#([\w-]+))?")
+BARE_RX = re.compile(r"(?<![\w/.-])records/(?:sessions|meetings|experiments|history)/[^\s`)>|、。<>\[\]*…{}]+")
+unreadable = []
 START = "<!-- links:start（harness-record-links が作る。人も Claude も直接書き換えない） -->"
 START_RX = re.compile(r"<!-- links:start[^>]*-->")
 END = "<!-- links:end -->"
@@ -89,19 +101,51 @@ def collect_nodes():
     return nodes
 
 
-def key_regex(key: str):
-    if re.fullmatch(r"[0-9a-f]{8}", key):
-        return re.compile(rf"(?<![0-9a-zA-Z]){key}(?![0-9a-zA-Z])")
-    if re.fullmatch(r"exp-[a-z0-9-]+", key):
-        return re.compile(rf"(?<![\w-]){re.escape(key)}(?![\w-])")
-    return re.compile(re.escape(key) + r"(?:/README\.md)?(?:#([\w-]+))?")
+def read(p: Path) -> str:
+    """UTF-8 で読む。読めない字があれば置き換えて読み、読めなかったファイルとして知らせる（全体を止めない）。"""
+    try:
+        return p.read_text(encoding="utf-8-sig")
+    except UnicodeDecodeError:
+        unreadable.append(rel(p))
+        return p.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+
+
+def find_keys(text, keys):
+    """名前の前後が区切られている所だけを拾う。戻り値：{記録: 印の集まり}。str.find で探すので、記録が増えても遅くなりにくい。"""
+    found = {}
+    for key, dst, hexid in keys:
+        i = text.find(key)
+        while i != -1:
+            j = i + len(key)
+            before_ok = i == 0 or not (text[i - 1].isalnum() or text[i - 1] in "_-.")
+            if before_ok:
+                m = TAIL_RX.match(text, j)
+                end = m.end()
+                nxt = text[end] if end < len(text) else ""
+                if hexid:
+                    after_ok = not (nxt.isascii() and nxt.isalnum())
+                elif key.endswith(".md") and end == j:
+                    after_ok = not (nxt.isascii() and (nxt.isalnum() or nxt in "_-"))
+                else:
+                    after_ok = not (nxt.isalnum() or nxt in "_-")
+                if after_ok:
+                    found.setdefault(dst, set())
+                    if m.group(1):
+                        found[dst].add(m.group(1))
+            i = text.find(key, i + 1)
+    return found
 
 
 def anchors_of(p: Path):
-    try:
-        return set(re.findall(r'<a id="([\w-]+)"></a>', p.read_text(encoding="utf-8")))
-    except OSError:
-        return set()
+    return set(re.findall(r'<a id="([\w-]+)"></a>', read(p)))
+
+
+def skip_target(t: str) -> bool:
+    """確かめないリンク先：URL、同じファイルの中の印、git の外のもの、ひな形の書きかけ。"""
+    return (re.match(r"^[a-zA-Z][\w+.-]*:", t) is not None or t.startswith("#") or "*" in t or "{{" in t
+            or "records/sessions/raw/" in t or "/export/" in t or t.startswith("export/"))
 
 
 def link_to(src_dir: Path, dst: Path, anchor=None) -> str:
@@ -117,35 +161,67 @@ def main():
     hook, check = "--hook" in sys.argv, "--check" in sys.argv
     if not (HUB / "hub").exists():
         return
+    if (HUB / ".git").is_file():
+        return  # ハブのワークツリーの中では何もしない（元のハブで作り直す）
     nodes = collect_nodes()
-    regs = {n: [key_regex(k) for k in v["keys"]] for n, v in nodes.items()}
+    keys = sorted(((k, n, bool(re.fullmatch(r"[0-9a-f]{8}", k))) for n, v in nodes.items() for k in v["keys"]),
+                  key=lambda x: -len(x[0]))
+    by_path = {v["path"].resolve(): n for n, v in nodes.items()}
     out_edges = {n: {} for n in nodes}   # src -> {dst: set(anchors)}
     broken = []
+    anchor_cache = {}
+
+    def check_anchor(src, dst, a):
+        if not ANCHOR_ID_RX.match(a):
+            return  # 見出しへの印などは確かめない
+        if dst not in anchor_cache:
+            anchor_cache[dst] = anchors_of(nodes[dst]["path"])
+        if a not in anchor_cache[dst]:
+            broken.append((src, f"{dst}#{a}", "印が無い"))
 
     sources = [n for n, v in nodes.items() if v["kind"] != "文字起こし"]
     for src in sources:
-        text = strip_generated(nodes[src]["path"].read_text(encoding="utf-8"))
-        for dst, rxs in regs.items():
+        sp = nodes[src]["path"]
+        text = strip_generated(read(sp))
+        for dst, anchors in find_keys(text, keys).items():
             if dst == src:
                 continue
-            found, anchors = False, set()
-            for rx in rxs:
-                for m in rx.finditer(text):
-                    found = True
-                    if m.groups() and m.group(1):
-                        anchors.add(m.group(1))
-            if found:
-                out_edges[src][dst] = anchors
-                if anchors:
-                    have = anchors_of(nodes[dst]["path"])
-                    for a in sorted(anchors - have):
-                        broken.append((src, f"{dst}#{a}", "印が無い"))
-        # 記録らしいパスで、実在しないもの
-        for m in re.finditer(r"records/(?:sessions|meetings|experiments|history)/[^\s`)>|（）、。]+", text):
-            path = m.group(0).split("#")[0].rstrip("/")
-            cand = HUB / path
-            if not cand.exists() and not (HUB / (path + "/README.md")).exists() and "<" not in path and "{" not in path:
+            out_edges[src].setdefault(dst, set()).update(anchors)
+            for a in sorted(anchors):
+                check_anchor(src, dst, a)
+        # Markdown のリンクの先を、その記録のフォルダから（無ければハブから）たどって確かめる
+        for m in LINK_RX.finditer(text):
+            t = m.group(1).strip("<>").strip()
+            if skip_target(t):
+                continue
+            path_part, _, anchor = unquote(t).partition("#")
+            if not path_part:
+                continue
+            cands = [(sp.parent / path_part).resolve(), (HUB / path_part).resolve()]
+            hit = next((c for c in cands if c.exists()), None)
+            if hit is None:
+                broken.append((src, t, "ファイルが無い"))
+                continue
+            dst = by_path.get(hit) or by_path.get((hit / "README.md").resolve())
+            if dst and dst != src:
+                out_edges[src].setdefault(dst, set())
+                if anchor:
+                    out_edges[src][dst].add(anchor)
+                    check_anchor(src, dst, anchor)
+        # リンクにせずに書いた記録のパスで、実在しないもの
+        for m in BARE_RX.finditer(text):
+            if m.start() > 0 and text[m.start() - 1] in "(<":
+                continue  # リンクの先は、上で確かめた
+            path = m.group(0).split("#")[0]
+            k = path.find(".md")
+            path = (path[:k + 3] if k != -1 else path).rstrip("/")
+            if skip_target(path):
+                continue
+            # 全角の括弧は、フォルダの名前の一部のことも、後ろの説明のこともある。括弧の手前で切った形も確かめる
+            cands = [path] + [path[:i].rstrip("/") for i in range(len(path) - 1, 0, -1) if path[i] in "（）"]
+            if not any((HUB / c).exists() for c in cands if c):
                 broken.append((src, path, "ファイルが無い"))
+    broken = sorted(set(broken))
 
     in_edges = {n: {} for n in nodes}
     for src, dsts in out_edges.items():
@@ -159,7 +235,7 @@ def main():
             continue
         if any(nodes[s]["kind"] == "相談" for s in in_edges[n]):
             continue
-        if NO_MEETING_RX.search(v["path"].read_text(encoding="utf-8")):
+        if NO_MEETING_RX.search(read(v["path"])):
             continue
         unlinked.append(n)
 
@@ -170,7 +246,17 @@ def main():
         print(f"相談の記録につながっていない文字起こし：{len(unlinked)}")
         for n in unlinked:
             print("  ", n)
+        if unreadable:
+            print(f"UTF-8 で読めなかったファイル（字を置き換えて読んだ）：{len(set(unreadable))}")
+            for n in sorted(set(unreadable)):
+                print("  ", n)
         return
+
+    def write(p: Path, text: str):
+        p.parent.mkdir(parents=True, exist_ok=True)
+        tmp = p.with_name(p.name + ".tmp")
+        tmp.write_text(text, encoding="utf-8", newline="\n")
+        os.replace(tmp, p)
 
     def grouped(items, base_dir, with_anchor):
         by = {}
@@ -191,10 +277,10 @@ def main():
 
     # 各記録の末尾に、指しているもの
     for n, v in nodes.items():
-        if not v["inject"] or rel(v["path"]) in GENERATED:
-            continue
+        if not v["inject"] or rel(v["path"]) in GENERATED or rel(v["path"]) in unreadable:
+            continue  # 読めなかったファイルには書き込まない（字を置き換えたまま書き戻さないため）
         p = v["path"]
-        text = p.read_text(encoding="utf-8")
+        text = read(p)
         items = [(s, a) for s, a in in_edges[n].items()]
         body = grouped(items, p.parent, True) or ["- （まだ無い）"]
         block = "\n".join([START, *body, END])
@@ -205,7 +291,7 @@ def main():
         else:
             new = text.rstrip("\n") + f"\n\n{HEAD}\n\n{block}\n"
         if new != text:
-            p.write_text(new, encoding="utf-8")
+            write(p, new)
 
     # records/links.md
     links_md = HUB / "records" / "links.md"
@@ -215,6 +301,10 @@ def main():
          "- 指されているもの：その記録を指している記録（各記録の末尾にも同じものがある）", ""]
     if broken:
         L += ["## 切れたリンク", ""] + [f"- {s} → `{d}`（{why}）" for s, d, why in broken] + [""]
+    if unreadable:
+        L += ["## UTF-8 で読めなかったファイル", "",
+              "字を置き換えて読んだので、リンクを取りこぼしているかもしれない。UTF-8 で保存し直す。逆向きのリンクは書き込んでいない。", ""]
+        L += [f"- `{n}`" for n in sorted(set(unreadable))] + [""]
     if unlinked:
         L += ["## 相談の記録につながっていない文字起こし", "",
               "どの相談の記録にも書かれていない文字起こし。`harness-meeting-record` でつなぐ。相談ではないものは、文字起こしの冒頭の「相談の記録」の行を「なし」にする。", ""]
@@ -233,7 +323,7 @@ def main():
                 L += ["指しているもの：", ""] + outs + [""]
             if ins:
                 L += ["指されているもの：", ""] + ins + [""]
-    links_md.write_text("\n".join(L).rstrip() + "\n", encoding="utf-8")
+    write(links_md, "\n".join(L).rstrip() + "\n")
 
     # chats/README.md
     chats_md = HUB / "chats" / "README.md"
@@ -247,11 +337,12 @@ def main():
         cell = "<br>".join(u[2:] for u in users) if users else "（まだ無い）"
         C.append(f"| [{v['label']}]({link_to(chats_md.parent, v['path'])}) | {cell} |")
     if chats_md.parent.exists():
-        chats_md.write_text("\n".join(C) + "\n", encoding="utf-8")
+        write(chats_md, "\n".join(C) + "\n")
     if not hook:
         n_edges = sum(len(d) for d in out_edges.values())
         print(f"記録 {len(nodes)} 件、リンク {n_edges} 本。切れたリンク {len(broken)} 件、"
-              f"相談の記録につながっていない文字起こし {len(unlinked)} 件（records/links.md）")
+              f"相談の記録につながっていない文字起こし {len(unlinked)} 件、"
+              f"読めなかったファイル {len(set(unreadable))} 件（records/links.md）")
 
 
 if __name__ == "__main__":
