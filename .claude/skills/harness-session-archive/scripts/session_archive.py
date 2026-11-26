@@ -38,7 +38,9 @@ OUT = HUB / "records" / "sessions"
 RAW = OUT / "raw"
 DIGEST = RAW / "digest"
 CACHE = RAW / ".index.json"
-LOCK = RAW / ".lock"
+# 記録どうしのリンクのスクリプトと共有するロック。git の中（.git/）に置く（git に入らず、目にも触れない）
+LOCK = (HUB / ".git" / "hub-scripts.lock") if (HUB / ".git").is_dir() else (HUB / "records" / ".hub-scripts.lock")
+STALE_SEC = 180  # これより古いロックは、止められた実行が残したものとして外す（フックの上限 180 秒に合わせる）
 CACHE_VERSION = 3  # 読み方を変えたら上げる。上がると、すべての会話を一度読み直す
 SOURCES = HUB / "hub" / "session-sources.txt"
 PROJECTS = Path.home() / ".claude" / "projects"
@@ -81,11 +83,12 @@ def load_sources():
         if not line or line.startswith("#"):
             continue
         if line.startswith("!"):
-            x = line[1:].strip()
-            if x:  # 「!」だけの行で、すべての会話を除いてしまわないように
-                excludes.append(x)
+            x = line[1:].split()
+            if x:  # 「!」だけの行で、すべての会話を除いてしまわないように。後ろの説明は読み飛ばす
+                excludes.append(x[0].strip("\"'"))
         else:
-            dirs.append(line)
+            # エクスプローラーの「パスのコピー」が付ける引用符を外し、~ を展開する
+            dirs.append(os.path.expanduser(line.strip("\"'")))
     if str(HUB) not in dirs:
         dirs.insert(0, str(HUB))
     return dirs, excludes
@@ -283,14 +286,17 @@ def quote(md: str) -> str:
 
 
 def hub_commit_map():
-    """会話の ID → その会話のハブのコミット（「短い ID 日付 件名」）。git log は 1 回だけ起動する。"""
+    """会話の ID → その会話のハブのコミット（「短い ID 日付 件名」）。git log は 1 回だけ起動する。
+    git が動かなかったときは None（要約の冒頭の囲みを、空の一覧で書き直さないため）。"""
     try:
         # git の出力の文字コードの設定（i18n.logOutputEncoding）によらず UTF-8 で受け取る
         r = subprocess.run(["git", "-c", "i18n.logOutputEncoding=UTF-8", "-C", str(HUB), "log", "--all",
                             "--date=short", "--format=%x1e%h %ad%x1f%s%x1f%B"],
                            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=60)
     except (OSError, subprocess.SubprocessError, ValueError):
-        return {}
+        return None
+    if r.returncode != 0:
+        return None  # git が無い、所有者の警告、壊れた参照など
     found = {}
     trailer_rx = re.compile(rf"^{TRAILER}:\s*(\S+)\s*$", re.M)
     for rec in (r.stdout or "").split("\x1e"):
@@ -336,8 +342,14 @@ def render_digest(s, items, parent_title):
 
 
 AUTO_START = "<!-- auto:start（harness-session-archive が作る。人も Claude も直接書き換えない） -->"
-AUTO_START_RX = re.compile(r"<!-- auto:start[^>]*-->")
+AUTO_START_RX = re.compile(r"^<!-- auto:start[^>\n]*-->[ \t]*$", re.M)
 AUTO_END = "<!-- auto:end -->"
+AUTO_END_RX = re.compile(r"^<!-- auto:end -->[ \t]*$", re.M)
+
+
+def no_marker(t: str) -> str:
+    """件名や題に書かれた「<!--」を、囲みの印と取り違えない形にする（表示は同じ）。"""
+    return t.replace("<!--", "&lt;!--")
 SUMMARY_BODY = """
 - 要約した範囲：（要約待ち）
 
@@ -370,12 +382,12 @@ def auto_block(s, r, parent, commits):
     if r["first"] and r["last"]:
         L.append(f"- 期間：{r['first']:%Y-%m-%d %H:%M} 〜 {r['last']:%Y-%m-%d %H:%M}")
     if parent:
-        L.append(f"- 分岐元：[{redact(parent['title'])}]({parent['file']})")
+        L.append(f"- 分岐元：[{no_marker(redact(parent['title']))}]({parent['file']})")
     L += [f"- 生の記録：`records/sessions/raw/{s['id']}.jsonl`（git の外。この PC だけ）",
           f"- 読める形：`records/sessions/raw/digest/{s['id']}.md`（git の外）"]
     if commits:
         L.append(f"- この会話でのハブのコミット（{TRAILER}）：")
-        L += [f"  - {c}" for c in commits]
+        L += [f"  - {no_marker(c)}" for c in commits]
     L.append(AUTO_END)
     return "\n".join(L)
 
@@ -402,14 +414,30 @@ def main_hub_of_worktree():
         r = subprocess.run(["git", "-C", str(HUB), "rev-parse", "--absolute-git-dir", "--git-common-dir"],
                            capture_output=True, text=True, timeout=10)
     except (OSError, subprocess.SubprocessError):
-        return None
+        return main_hub_by_git_file()
     lines = r.stdout.split("\n")
     if r.returncode != 0 or len(lines) < 2 or not lines[1].strip():
-        return None
+        return main_hub_by_git_file()
     git_dir = Path(lines[0].strip()).resolve()
     common = Path(lines[1].strip())
     common = (common if common.is_absolute() else HUB / common).resolve()
     return common.parent if git_dir != common else None
+
+
+def main_hub_by_git_file():
+    """git が動かないとき：ワークツリーでは .git がファイル（gitdir: <元>/.git/worktrees/<名前>）。分からなければ、何も書かない側に倒す。"""
+    g = HUB / ".git"
+    if not g.is_file():
+        return None
+    try:
+        line = g.read_text(encoding="utf-8").strip()
+    except OSError:
+        return HUB
+    if not line.startswith("gitdir:"):
+        return HUB
+    gd = Path(line.split(":", 1)[1].strip())
+    gd = (gd if gd.is_absolute() else HUB / gd).resolve()
+    return gd.parents[2] if gd.parent.name == "worktrees" and len(gd.parents) > 2 else HUB
 
 
 def write_text(path: Path, text: str):
@@ -441,7 +469,9 @@ def replace(tmp, path):
 
 
 def acquire_lock(wait=120):
-    """同時に動いた別の会話のフックと、順番に動くためのロック。止まった実行が残したもの（10 分より古い）は外す。"""
+    """同時に動いた別の会話のフックや、記録どうしのリンクのスクリプトと、順番に動くためのロック。
+    止められた実行が残したもの（STALE_SEC より古い）は外す。長く動くあいだは keep_lock で時刻を新しくする。"""
+    LOCK.parent.mkdir(parents=True, exist_ok=True)
     deadline = time.time() + wait
     while True:
         try:
@@ -452,7 +482,7 @@ def acquire_lock(wait=120):
             return True
         except FileExistsError:
             try:
-                if time.time() - LOCK.stat().st_mtime > 600:
+                if time.time() - LOCK.stat().st_mtime > STALE_SEC:
                     LOCK.unlink(missing_ok=True)
                     continue
             except OSError:
@@ -460,6 +490,20 @@ def acquire_lock(wait=120):
             if time.time() > deadline:
                 return False
             time.sleep(0.2)
+
+
+_last_touch = [0.0]
+
+
+def keep_lock():
+    """長く動くとき、ロックが古いものと見なされないように、ときどき時刻を新しくする。"""
+    now = time.time()
+    if now - _last_touch[0] > 20:
+        try:
+            os.utime(LOCK)
+        except OSError:
+            pass
+        _last_touch[0] = now
 
 
 def copy_file(src: Path, dst: Path):
@@ -515,7 +559,8 @@ def main():
     roots = [norm(d) for d in dirs]
     for d in (OUT, RAW, DIGEST):
         d.mkdir(parents=True, exist_ok=True)
-    if not acquire_lock():
+    # フックからは長く待たない（持ち時間が短いため）。毎回すべてを照らし直すので、次の実行で追いつく
+    if not acquire_lock(20 if a.hook else 120):
         if not a.hook:
             print(f"ほかの実行が終わらないので、何もしない（{LOCK} が残っていれば、動いている実行が無いことを確かめて消す）")
         return
@@ -530,6 +575,7 @@ def main():
 
     sessions = []
     for f in candidate_files(dirs):
+        keep_lock()
         sid = f.stem
         if any(sid.startswith(x) for x in excludes):
             continue
@@ -561,6 +607,16 @@ def main():
         # 生の記録をハブに写す（一覧だけのときと、すでにハブの写しから読んだときは写さない）
         if not a.list and f.resolve().parent != raw_dir:
             copy_file(f, RAW / f.name)
+
+    if not a.hook:
+        seen = [norm(v["cwd"]) for k, v in cache.items() if k != "_v" and isinstance(v, dict) and v.get("cwd")]
+        hub_n = norm(str(HUB))
+        idle = [d for d, r0 in zip(dirs, roots) if r0 != hub_n
+                and not any(c == r0 or c.startswith(r0 + "\\") or c.startswith(r0 + "/") for c in seen)]
+        if idle:
+            print("hub/session-sources.txt の次の行は、どの会話にも当たらなかった（まだ会話が無いか、パスが違う）：")
+            for d in idle:
+                print(f"  {d}")
 
     # 各発言の持ち主：発言に記された会話がその発言を持っていればその会話、無ければ最も早い会話
     def first_ts(s):
@@ -598,7 +654,10 @@ def main():
         return
 
     commits_of = hub_commit_map()
+    git_ok = commits_of is not None
+    commits_of = commits_of or {}
     for s in sessions:
+        keep_lock()
         r = rows[s["id"]]
         others = {}
         for u in s["uuids"]:
@@ -633,12 +692,13 @@ def main():
         if out.exists():
             text = out.read_text(encoding="utf-8")
             m = AUTO_START_RX.search(text)
-            if m and AUTO_END in text[m.end():]:
-                new = text[: m.start()] + block + text[text.index(AUTO_END, m.end()) + len(AUTO_END):]
+            e = AUTO_END_RX.search(text, m.end()) if m else None
+            if m and e and git_ok:
+                new = text[: m.start()] + block + text[e.end():]
             else:
-                new = text
+                new = text  # 囲みが無い・崩れている、または git が動かず、ハブのコミットの一覧が作れない
         else:
-            new = f"# 会話の要約：{redact(r['title'])}\n\n{block}\n{summary_body()}"
+            new = f"# 会話の要約：{no_marker(redact(r['title']))}\n\n{block}\n{summary_body()}"
         if not out.exists() or out.read_text(encoding="utf-8") != new:
             write_text(out, new)
         if NOT_SUMMARIZED_RX.search(new):
@@ -653,6 +713,16 @@ def main():
         cache[s["id"]].pop("changed", None)
 
     rows_l = [rows[s["id"]] for s in sessions]
+    kept = []  # (並べる鍵, 行)
+    known8 = {k[:8] for k in cache if k != "_v"} | {s["id"][:8] for s in sessions}
+    if (OUT / "README.md").exists():
+        row_rx = re.compile(r"^\| (?P<when>[^|]*) \|.*\| `(?P<id>[0-9a-f]{8})` \| \[(?P<file>[^\]]+)\]\(")
+        for line in (OUT / "README.md").read_text(encoding="utf-8").splitlines():
+            m = row_rx.match(line)
+            # この PC が知らない会話（別の PC で開いた会話、生の記録がこの PC に無い会話）だけを残す。
+            # この PC が知っていて対象の外にした会話（除いた、場所を外した）は残さない
+            if m and m.group("id") not in known8 and (OUT / m.group("file")).exists():
+                kept.append((m.group("when").strip(), line))
     idx = ["# 会話の記録", "",
            "研究に関係する Claude Code の会話の要約。**履歴の記録**なので、書かれた決定はその時点のもの（現在の決定は `hub/decisions.md`）。",
            "", "- 対象：`hub/session-sources.txt` の作業ディレクトリで開いた会話",
@@ -660,7 +730,11 @@ def main():
            f"- 決定と会話のつながり：`hub/decisions.md` の「会話」の欄、またはコミットの `{TRAILER}:` の行",
            "- 生の記録（JSONL）と読める形：`records/sessions/raw/`（git の外。この PC だけ）", "",
            "| 開始 | 題 | 会話の ID | 要約 | 要約した範囲 |", "|---|---|---|---|---|"]
-    for r in rows_l:
+    lines = []
+    for s in sessions:
+        r = rows[s["id"]]
+        start = local(first_ts(s))
+        key = f"{r['first']:%Y-%m-%d %H:%M}" if r["first"] else (f"{start:%Y-%m-%d %H:%M}" if start else "")
         when = f"{r['first']:%Y-%m-%d %H:%M}" if r["first"] else ""
         title = redact(r["title"]).replace("|", "／") + ("（分岐）" if r.get("parent") else "")
         if r["file"]:
@@ -670,7 +744,8 @@ def main():
             par = r.get("parent")
             link = f"自分の発言なし。中身は [{par['file']}]({par['file']})" if par else "自分の発言なし"
             state = "―"
-        idx.append(f"| {when} | {title} | `{r['id'][:8]}` | {link} | {state} |")
+        lines.append((key, f"| {when} | {title} | `{r['id'][:8]}` | {link} | {state} |"))
+    idx += [line for _, line in sorted(lines + kept, key=lambda x: x[0])]
     write_text(OUT / "README.md", "\n".join(idx) + "\n")
     cache["_v"] = CACHE_VERSION
     write_text(CACHE, json.dumps(cache, ensure_ascii=False))
@@ -681,6 +756,8 @@ def main():
                   f"要約した範囲：{r.get('until') or 'なし'}  最後の発言：{(r['last_talk'] or r['last']):%Y-%m-%d %H:%M}")
     elif not a.hook:
         print(f"会話 {len(rows_l)} 件を更新した。要約が要る会話：{len(pend)} 件（--pending で一覧）")
+    if not git_ok and not a.hook:
+        print("git が動かなかったので、要約の冒頭の囲み（ハブのコミットの一覧など）は書き換えなかった")
 
 
 if __name__ == "__main__":
