@@ -18,7 +18,7 @@
 
 ## 2. 最初に読むもの
 
-（レビューの作業は、この 1〜2 を読まず、`<hub>/harness/roles/review.md` の「起動と読むもの」に従う）
+（レビューの作業は、この 1〜2 を読まず、`<hub>/harness/roles/review.md` の「起動と読むもの」に従う。研究の中身として読むのは、この指示書と、3 と「1. 目的」の「レビューの観点と渡す情報」に書いたものだけ。統括は、読ませる資料をその二つに同じに書く）
 
 1. `<hub>/harness/roles/common.md` と `<hub>/harness/roles/{{役}}.md`（試行なら `trial.md` と、確かめる内容の種類の手引きの両方。`<hub>/hub/roles/{{役}}.md` があればその後に）
 2. `<hub>/hub/state.md`、`<hub>/harness/base-rules.md`、`<hub>/hub/rules.md`、`<hub>/hub/profile.md`（ハブの外で動くときは `<hub>/CLAUDE.md` も）

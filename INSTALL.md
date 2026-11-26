@@ -33,8 +33,12 @@ Claude Code 以外の AI で導入するときは、先に `harness/other-ai.md`
 
    入ったことを確かめる。`git push --dry-run template HEAD` が失敗し、`git config core.hooksPath` が `harness/hooks` を返せばよい。
    - push 先を無効にしたので、ひな形には送れない。
-   - `harness/hooks/pre-push` が、許可していないリモートへの push を止める。許可は `git config --add hub.pushAllowed <リモート名>` で足す。研究者が、そのリモートが非公開であることを確かめてから、研究者自身が行う。
+   - `harness/hooks/pre-push` が、許可していないリモートへの push を止める。許可は `git config --add hub.pushAllowed <リモート名>` で足す。研究者が、そのリモートが非公開であることを確かめてから、研究者自身が行う。AI は、頼まれても行わず、コマンドを示すだけにする（`CLAUDE.md` の「ハブを公開しない」）。
    - 許可したリモートでも、履歴を書き換える push（force push）と、ブランチやタグの削除は止まる（`CLAUDE.md` の「履歴を書き換えない」）。
+   - **別の PC でハブを複製し直したとき**：git の設定は複製に写らないので、`template` のリモート、`core.hooksPath`、`hub.pushAllowed` が無い。git の外の `.claude/settings.local.json` も無い。
+     1. `git remote` に `template` が無ければ、先に `git remote add template <ひな形の URL>` で足してから、上の 2 行を行う。
+     2. push の許可（`hub.pushAllowed`）は、研究者が自分で足し直す（上と同じ。AI はコマンドを示すだけ）。
+     3. `.claude/settings.local.json` は、`hub/rules.md` の「研究独自のスキル・手引き・ひな形」の記載から作り直す（README の「`base-` のスキルを研究独自のスキルに置き換える」の 6）。
 4. 取得できたら、`<フォルダ>/.claude/skills/harness-install/SKILL.md` を読み、その手順に従って続ける。
    - いまのセッションがハブの外で動いていても、そのファイルを読んで手順どおりに進めてよい。
    - 導入が終わったら、ハブのフォルダで新しいセッションを開くよう、ユーザーに伝える。そのセッションが統括役になる。

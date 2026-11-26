@@ -67,6 +67,7 @@ Claude Code 以外の AI が導入するときは、`harness/other-ai.md` の「
      - 論旨だけ（`argument.md`）
      - 論旨、骨子、本文の仮組（修論・博論のような長い文書）
      - 研究者が挙げる組
+6. コードのリポジトリ、データ、文献（原文）の場所（「まだ無い」でよい）。`hub/profile.md` の「場所」の表に書く。コードのリポジトリは、公開か非公開かも聞く。下の「6. コードのリポジトリとつなぐ」でつなぐのは、ここで挙げたリポジトリ（進行中の研究なら、5.1 で挙げたものも）。
 
 ## 3. 公開範囲とコミット
 
@@ -75,7 +76,7 @@ Claude Code 以外の AI が導入するときは、`harness/other-ai.md` の「
    - 非公開のリモート：研究者がリポジトリを作り、URL を教えてもらう。
      1. `git remote add origin <URL>`
      2. 非公開であることを確かめる。GitHub なら `gh repo view <owner/name> --json visibility` が `PRIVATE`。確かめられなければ、研究者に GitHub の画面で確かめてもらう。
-     3. 研究者自身に、`git config --add hub.pushAllowed origin` を実行してもらう。
+     3. 研究者自身に、`git config --add hub.pushAllowed origin` を実行してもらう。Claude は、頼まれても実行せず、コマンドを示すだけにする（`CLAUDE.md` の「ハブを公開しない」）。
    - push の守り（`INSTALL.md` の 1-3）が入っていることも、ここで確かめる。
 2. ハブの控えを取るか（既定：取らない）。
    - 取るなら、取り方と置き場所を研究者が決める（例：外付けのディスクやクラウドのフォルダに `git bundle`、非公開のリモート）。いつ取るかも研究者が決める。
@@ -117,7 +118,7 @@ Claude Code 以外の AI が導入するときは、`harness/other-ai.md` の「
 
 ### 5.1 資料の場所を聞く
 
-次の表の種類ごとに、場所を聞きます。分からないと言われたら、候補を探して示します。
+次の表の種類ごとに、場所を聞きます（2 の 6 で聞いた場所は聞き直さない）。分からないと言われたら、候補を探して示します。
 
 - ホームの下の git リポジトリ
 - Claude Code の履歴（`python -X utf8 <hub>/.claude/skills/harness-progress-timeline/scripts/claude_history.py --list`）
@@ -263,7 +264,7 @@ Claude Code 以外の AI が導入するときは、`harness/other-ai.md` の「
 
 **会話の記録（`records/sessions/`）**。
 
-- 研究に関係する作業ディレクトリ（論旨の文書のリポジトリなど。`claude_history.py --list` で探す）を、研究者に確かめて `hub/session-sources.txt` に足す。足さないと、その会話は残らない。
+- 研究に関係する作業ディレクトリ（論旨の文書のリポジトリなど。`claude_history.py --list` で探す）を、研究者に確かめて `hub/session-sources.txt` に足す。足さないと、その会話は残らない。`--list` は、記録のフォルダごとに、実際の作業ディレクトリのパスも出す。`hub/session-sources.txt` に書くのは、そのパス（記録のフォルダの名前ではない）。
 - `harness-session-archive` のスクリプトで、研究に関係する過去の会話の生の記録と読める形を残し、要約のひな形を作る。研究と関係ない会話があれば、研究者に聞いて `hub/session-sources.txt` で除く。
 - 過去の会話の要約を書く（書き方は `harness-session-archive`）。会話が多いときは、研究者に、全部を書くか、主な会話だけにするかを聞く。
 - 主な会話だけを要約するなら、残りの要約のファイルに「- 要約した範囲：要約しない（理由）」と書く。
@@ -286,7 +287,7 @@ Claude Code 以外の AI が導入するときは、`harness/other-ai.md` の「
 
 ## 6. コードのリポジトリとつなぐ
 
-登録したコードのリポジトリごとに、研究者に確かめてから行います。
+登録したコードのリポジトリ（2 の 6 と 5.1 で挙げたもの）ごとに、研究者に確かめてから行います。
 
 1. そのリポジトリの直下に `CLAUDE.local.md` を置く（`harness/templates/claude-local.md` から）。
    - 先に、そのファイルが git に入っていないかを確かめる（`git -C <リポジトリ> ls-files --error-unmatch CLAUDE.local.md` が失敗すれば入っていない）。入っていれば書き込まず、研究者に聞く。git に入っているファイルには 2 の `.git/info/exclude` が効かず、ハブのパスがコミットされるため。

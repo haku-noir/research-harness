@@ -56,7 +56,7 @@ description: 研究の進捗を日付ごとに整理し、何が変わったか�
    python -X utf8 .claude/skills/harness-progress-timeline/scripts/claude_history.py --project <作業ディレクトリ> --subdirs --since YYYY-MM-DD --out <git の外の一時ファイル>
    ```
 
-   - `--project` には、そのとき Claude Code を開いていたディレクトリを指定する。`--subdirs` で、その下のフォルダやワークツリーで開いた会話も含める。
+   - `--project` には、そのとき Claude Code を開いていたディレクトリを指定する（`--list` が、記録のフォルダごとに実際の作業ディレクトリを出す）。`--subdirs` で、その下のフォルダやワークツリーで開いた会話も含める。
    - 分岐した会話の重複は除かれる。時刻は手元の時刻。
    - 出力には研究の中身がそのまま入るので、git の外（一時フォルダ）に書く。
 
