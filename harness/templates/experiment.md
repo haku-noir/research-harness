@@ -48,7 +48,7 @@
 
 （クリックできる相対リンクで書く。書き方は `harness-record-links`）
 
-- 決定：{{hub/decisions.md の項目の名前}}
+- 決定：{{[hub/decisions.md](../../../hub/decisions.md)（項目の名前）}}
 - 相談：{{この実験を決めた・見せた相談の記録}}
 - 会話：{{設計を決めた会話、実装した会話、解析した会話の要約}}
 - 指示書・報告：{{hub/briefs/<id>.md、hub/reports/<id>.md}}

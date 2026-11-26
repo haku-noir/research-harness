@@ -6,7 +6,7 @@
 
 ## 始めるとき
 
-- **push の守りが入っているか。** 次の三つを確かめる。どれかが無ければ、研究者に伝えて、`INSTALL.md` の「push の守り」を入れる。
+- **push の守りが入っているか。** 次の三つを確かめる。どれかが無ければ、研究者に伝えて、`INSTALL.md` の 1-3（push の守りを入れる）を行う。
   - `git config core.hooksPath` が `harness/hooks`
   - `git config remote.template.pushurl` が無効な値（`no-push-to-template`）
   - `harness/hooks/pre-push` がある

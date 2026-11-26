@@ -12,7 +12,9 @@
 
 ## 最初に確かめること
 
-- **`hub/` が無い**：まだ導入していない。`INSTALL.md` と `.claude/skills/harness-install/SKILL.md` に従って導入するか、研究者に聞く。
+- **`hub/` が無い**：導入前のひな形か、ひな形を直すための複製（README の「ひな形を直すとき」）。
+  - 研究者が「ひな形を直す」と言った、またはその複製なら、導入しない。ハブの約束（ファイルの持ち主、ひな形の層を書き換えない、コミットの説明の形など）は使わず、仕組みの部分を直す。研究の中身と、他人のものは入れない。
+  - そうでなければ、`INSTALL.md` と `.claude/skills/harness-install/SKILL.md` に従って導入するか、研究者に聞く。
 - **この会話の役**：
   - 指示書（`hub/briefs/<id>.md`）を渡されて始まったなら、作業の会話。`harness/roles/common.md` と、指示書が示す役の手引きに従う。
   - そうでなければ統括。最初に `harness/roles/orchestrator.md` を読み、その「始めるとき」を行う。
@@ -71,7 +73,7 @@ Hub-Session: <会話の ID（あれば）>
 - **`Hub-Agent:` は必ず付ける**（Claude でも）。どの AI の作業かを、履歴から分かるようにするため。
 - `Hub-Model:` と `Hub-Effort:` は、分かれば付ける。Claude Code では、モデルは Claude が知っている自分のモデルの名前、エフォートは環境変数 `CLAUDE_EFFORT` の値。
 - `Hub-Session:` は、その AI に会話の ID があれば付ける（Claude Code では環境変数 `CLAUDE_CODE_SESSION_ID`）。会話の要約とコミットを互いにたどれるようにするため。
-- **例外**：会話の記録や記録どうしのリンクの、自動の更新だけのコミット（件名が `chore(sessions):`・`chore(links):`）には、`Hub-Session:` を付けない（`Hub-Agent:` は付ける）。付けると、会話の要約のコミットの一覧が更新のたびに変わり、更新が終わらないため。
+- **例外**：会話の記録（自動の更新と、ほかの会話の要約を書いた・足しただけのもの）や記録どうしのリンクの更新だけのコミット（件名が `chore(sessions):`・`chore(links):`）には、`Hub-Session:` を付けない（`Hub-Agent:` は付ける）。付けると、会話の要約のコミットの一覧が更新のたびに変わり、更新が終わらないため。
 
 **履歴を書き換えない**：作ったコミットを消したり書き換えたりしない。
 
@@ -119,6 +121,6 @@ Hub-Session: <会話の ID（あれば）>
 ## スキルとひな形の層
 
 - **スキルは、頼まれた内容に合うものを説明文で選ぶ。** 見本のスキル（`base-`）は、`hub/rules.md` に、この研究で代わりに使うスキルが書いてあればそちらを使う。仕組みのスキル（`harness-`）は置き換えない。
-- **ひな形の層は書き換えない。** `CLAUDE.md`、`AGENTS.md`、`INSTALL.md`、`README.md`、`LICENSE`、`harness/`、`.claude/skills/harness-*`、`.claude/skills/base-*`、`.claude/settings.json`、`.gitattributes`、`.gitignore`（末尾の「この研究で足したもの」より上）。研究に合わせて直すときは研究の層に書く。手順と、仕組みが読む部分（研究の層で差し替えても残すもの）は README の「研究に合わせて直す」。
+- **ハブの中では、ひな形の層は書き換えない。** `CLAUDE.md`、`AGENTS.md`、`INSTALL.md`、`README.md`、`LICENSE`、`harness/`、`.claude/skills/harness-*`、`.claude/skills/base-*`、`.claude/settings.json`、`.gitattributes`、`.gitignore`（末尾の「この研究で足したもの」より上）。研究に合わせて直すときは研究の層に書く。手順と、仕組みが読む部分（研究の層で差し替えても残すもの）は README の「研究に合わせて直す」。
 - **上書きできないもの**：このファイルの約束と、仕組みのスキル。研究の層に書いても無効で、変えたいときはひな形そのものを直す。
 - **ひな形の更新**：「ひな形に更新はある？」「ひな形の更新を取り込んで」と頼まれたら、`INSTALL.md` の 2 に従う。頼まれないのに、更新を探したり取り込んだりしない。

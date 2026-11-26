@@ -5,7 +5,7 @@
 - 状態：準備 / 進行 / 研究者待ち / 別に保持 / 保留
 - 完了・合流・中止した作業は、この表から消す。結果はコミットの説明と、指示書・報告に残る。
 - 「セッション」の欄には、その作業の会話を書く。同じ作業を新しい会話で続けたら、前の会話の後ろに足す（`harness-dispatch` の「同じ作業を新しい会話で続ける」）。
-- id：`<種類>-<短い名前>`（例：`impl-pilot-display`、`ana-pilot1`、`arg-v33`、`lit-eval-task`、`slides-2026-12-03`、`trial-midpoint-only`、`rev-arg-v3`、導入の段 2 の `imp-chats`）
+- id：`<種類>-<短い名前>`（例：`impl-pilot-display`、`ana-pilot1`、`arg-v2`、`lit-eval-task`、`slides-2026-12-03`、`trial-alt-design`、`rev-arg-v3`、導入の段 2 の `imp-chats`）
 
 | id | 種類 | 目的（論旨・実験のどこのためか） | 場所（ディレクトリ・ブランチ） | 担う AI | セッション | 状態 |
 |---|---|---|---|---|---|---|
