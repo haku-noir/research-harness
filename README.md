@@ -135,7 +135,7 @@ slides/                   発表資料
 
 ひな形を `hub/templates/` で差し替えるときも、`base-` のスキルを置き換えるときも、次は残してください。仕組みのスキルがここを読みます。
 
-- 記録の置き場所と名前：`chats/<名前>.md`、`records/meetings/<日付>_<題>/README.md`、`records/experiments/<id>/README.md`、`records/sessions/<開始日>_<ID の先頭 8 文字>.md`、`records/history/`、`hub/briefs/`、`hub/reports/`、`hub/research.md`、`papers/<論文の id>/*.md`
+- 記録の置き場所と名前：`chats/<名前>.md`、`records/meetings/<日付>_<題>/README.md`、`records/experiments/<id>/README.md`、`records/sessions/<開始日>_<ID の先頭 8 文字>.md`、`records/history/`、`hub/briefs/`、`hub/reports/`、`hub/research.md`、`papers/<論文の id>/` の下の `.md`（下のフォルダも含む。`export/` は除く）
 - 各記録の「関連」の欄と、決定の印（`<a id="d-…"></a>`）
 - 会話の要約の `auto` の囲みと、「要約した範囲」の行
 - 文字起こしの冒頭の「相談の記録」の行

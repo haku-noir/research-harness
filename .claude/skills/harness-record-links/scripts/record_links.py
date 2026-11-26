@@ -79,7 +79,11 @@ def collect_nodes():
     research = HUB / "hub" / "research.md"
     if research.exists():
         add(research, "論旨", ["hub/research.md"], "hub/research.md", False)
-    for p in sorted((HUB / "papers").glob("*/*.md")):
+    papers = HUB / "papers"
+    for p in (sorted(papers.rglob("*.md")) if papers.exists() else []):
+        # 章ごとのフォルダ（papers/<id>/chapters/…）も拾う。確認用の資料の出力（export/。git の外）は除く
+        if "export" in p.relative_to(papers).parts[1:-1]:
+            continue
         r = rel(p)
         add(p, "論旨", [r], r, False)
     return nodes
