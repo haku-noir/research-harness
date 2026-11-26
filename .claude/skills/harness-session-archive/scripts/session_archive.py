@@ -223,16 +223,27 @@ def quote(md: str) -> str:
     return "\n".join("> " + l if l.strip() else ">" for l in md.splitlines())
 
 
-def hub_commits(sid):
+def hub_commit_map():
+    """会話の ID → その会話のハブのコミット（「短い ID 日付 件名」）。git log は 1 回だけ起動する。"""
     try:
         r = subprocess.run(["git", "-C", str(HUB), "log", "--all", "--date=short",
-                            "--format=%h %ad %s", f"--grep={TRAILER}: {sid}"],
-                           capture_output=True, text=True, encoding="utf-8", timeout=30)
-        # 会話の記録だけを更新するコミット（chore(sessions):）は載せない。載せると記録の更新が終わらないため
-        return [l for l in r.stdout.splitlines()
-                if l.strip() and " chore(sessions):" not in l and " chore(links):" not in l]
+                            "--format=%x1e%h %ad %s%x1f%B"],
+                           capture_output=True, text=True, encoding="utf-8", timeout=60)
     except (OSError, subprocess.SubprocessError):
-        return []
+        return {}
+    found = {}
+    trailer_rx = re.compile(rf"^{TRAILER}:\s*(\S+)\s*$", re.M)
+    for rec in r.stdout.split("\x1e"):
+        if "\x1f" not in rec:
+            continue
+        head, body = rec.split("\x1f", 1)
+        head = head.strip()
+        # 会話の記録だけを更新するコミット（chore(sessions):）は載せない。載せると記録の更新が終わらないため
+        if " chore(sessions):" in head or " chore(links):" in head:
+            continue
+        for sid in trailer_rx.findall(body):
+            found.setdefault(sid, []).append(head)
+    return found
 
 
 def render_digest(s, items, parent_title):
@@ -335,6 +346,12 @@ def main():
         d.mkdir(parents=True, exist_ok=True)
     cache = json.loads(CACHE.read_text(encoding="utf-8")) if CACHE.exists() else {}
 
+    def in_scope(cwd):
+        if not cwd:
+            return False
+        n = norm(cwd)
+        return any(n == r or n.startswith(r + "\\") or n.startswith(r + "/") for r in roots)
+
     sessions = []
     for f in candidate_files(dirs):
         sid = f.stem
@@ -343,16 +360,21 @@ def main():
         st = f.stat()
         key = [st.st_size, int(st.st_mtime)]
         c = cache.get(sid)
-        if c and c.get("key") == key and (c.get("skip") or "labels" in c):
-            if not c.get("skip"):
-                sessions.append({"id": sid, "path": f, "parsed": None, **c})
-            continue
+        # 対象かどうかは、記録した作業ディレクトリ（cwd）を、いまの hub/session-sources.txt と毎回照らして決め直す。
+        # 作業ディレクトリを足したり外したりしても、会話のファイルを読み直さずに反映されるようにするため
+        if c and c.get("key") == key:
+            if "labels" in c:
+                if in_scope(c.get("cwd")):
+                    sessions.append({"id": sid, "path": f, "parsed": None, **c})
+                else:
+                    cache[sid] = {"key": key, "skip": True, "cwd": c.get("cwd"), "talk": True}
+                continue
+            if c.get("skip") and "cwd" in c and not (c.get("talk") and in_scope(c["cwd"])):
+                continue
         p = parse(f)
-        in_scope = p["cwd"] and any(
-            norm(p["cwd"]) == r or norm(p["cwd"]).startswith(r + "\\") or norm(p["cwd"]).startswith(r + "/")
-            for r in roots)
-        if not in_scope or not any(i["kind"] in ("user", "answer") for i in p["items"]):
-            cache[sid] = {"key": key, "skip": True}
+        talk = any(i["kind"] in ("user", "answer") for i in p["items"])
+        if not talk or not in_scope(p["cwd"]):
+            cache[sid] = {"key": key, "skip": True, "cwd": p["cwd"], "talk": talk}
             continue
         entry = {"key": key, "title": p["title"], "cwd": p["cwd"],
                  "uuids": [i["uuid"] for i in p["items"]], "labels": [i["label"] for i in p["items"]],
@@ -392,6 +414,7 @@ def main():
             print(f"{when}  {s['id'][:8]}  own={r['n_own']:5d}  {r['title'][:50]}")
         return
 
+    commits_of = hub_commit_map()
     for s in sessions:
         r = rows[s["id"]]
         others = {}
@@ -419,7 +442,7 @@ def main():
             olds = [x for x in OUT.glob(f"*_{s['id'][:8]}.md") if x != out]
             if olds:
                 olds[0].rename(out)
-        block = auto_block(s, r, parent, hub_commits(s["id"]))
+        block = auto_block(s, r, parent, commits_of.get(s["id"], []))
         if out.exists():
             text = out.read_text(encoding="utf-8")
             m = AUTO_START_RX.search(text)
