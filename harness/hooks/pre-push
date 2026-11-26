@@ -13,10 +13,37 @@
 remote="$1"
 url="$2"
 
+# URL の書き方の揺れをそろえる（https://github.com/o/r.git、git@github.com:o/r、https://github.com/o/r/ を同じとみなす）：
+# 小文字にし、方式（https:// など）と「ユーザー@」を外し、「ホスト:パス」を「ホスト/パス」にし、末尾の「/」と「.git」を外す
+norm_url() {
+  printf '%s\n' "$1" | tr 'A-Z' 'a-z' | sed \
+    -e 's#^[a-z][a-z0-9+.-]*://##' \
+    -e 's#^[^@/]*@##' \
+    -e 's#^\([^/:]*\):#\1/#' \
+    -e 's#/*$##' \
+    -e 's#\.git$##' \
+    -e 's#/*$##'
+}
+
 template_url=$(git config --get remote.template.url 2>/dev/null)
 
 if [ -n "$template_url" ]; then
-  if [ "$remote" = "template" ] || [ "$url" = "$template_url" ] || [ "$remote" = "$template_url" ]; then
+  template_norm=$(norm_url "$template_url")
+  # 送り先の URL と、リモート名に設定した URL（url と pushurl）のどれかが、ひな形の URL と同じなら止める
+  candidates=$(printf '%s\n%s\n' "$url" "$remote"
+    git config --get-all "remote.$remote.url" 2>/dev/null
+    git config --get-all "remote.$remote.pushurl" 2>/dev/null)
+  to_template=""
+  [ "$remote" = "template" ] && to_template="yes"
+  while IFS= read -r c; do
+    [ -z "$c" ] && continue
+    if [ "$(norm_url "$c")" = "$template_norm" ]; then
+      to_template="yes"
+    fi
+  done <<EOF
+$candidates
+EOF
+  if [ -n "$to_template" ]; then
     echo "止めました：研究ハブを、ひな形のリポジトリ（$template_url）に push しようとしています。" >&2
     echo "ハブには研究の中身が入っています。ひな形を直すときは、ひな形を別の場所に複製し、そこで直してください（README.md の「ひな形を直すとき」）。" >&2
     exit 1

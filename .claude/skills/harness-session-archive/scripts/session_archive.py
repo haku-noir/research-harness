@@ -5,10 +5,13 @@
   研究者の発言・Claude の返答の本文・道具の呼び出しの 1 行・選択肢での質問と回答を、時刻と uuid つきで載せる。
   分岐した会話は、各発言を元の会話（記録の各行の sessionId）に持たせ、同じ発言を二重に載せない。
 - 要約のファイル records/sessions/<開始日>_<ID の先頭 8 文字>.md（git で管理）を用意する。
-  - 無ければ、ひな形（中身は「要約待ち」）を作る。
-  - あれば、<!-- auto:start --> 〜 <!-- auto:end --> の間（会話の ID、期間、生の記録への参照、ハブのコミット）だけを書き直す。
+  - 無ければ、ひな形（中身は「要約待ち」）を作る。名前は作るときに決め、後から変えない（リンクを切らないため）。
+  - あれば、冒頭の <!-- auto:start --> 〜 <!-- auto:end --> の間（会話の ID、期間、生の記録への参照、ハブのコミット）だけを書き直す。
+    書き直すのは、囲みが最初の「## 」の見出しより前にあり、中身がこのスクリプトの書く形の行だけのときだけ。
+    崩れていれば触らずに知らせる。
   - 要約の本文は Claude が書く（.claude/skills/harness-session-archive/SKILL.md）。このスクリプトは書かない。
 - 一覧 records/sessions/README.md を作り直す。要約が要る会話（未要約、または要約した範囲の後に発言が増えた会話）を示す。
+  この PC に記録の無い会話（別の PC で開いた会話）も、要約のファイルがあれば載せる。
 
 対象の会話は hub/session-sources.txt に書いた作業ディレクトリ（その下のフォルダを含む）で開いた会話。
 「! <会話の ID の先頭>」の行で、その会話を除ける。
@@ -16,7 +19,7 @@
 使い方:
   python -X utf8 session_archive.py            （全部を更新。変わった会話だけを読み直す）
   python -X utf8 session_archive.py --pending  （更新して、要約が要る会話を出す）
-  python -X utf8 session_archive.py --hook     （Claude Code のフックから。標準入力は読み捨て、失敗しても 0 で終わる）
+  python -X utf8 session_archive.py --hook     （Claude Code のフックから。標準入力の transcript_path も探す場所に足す。失敗しても 0 で終わる）
   python -X utf8 session_archive.py --list     （対象の会話を一覧するだけ）
 """
 import argparse
@@ -40,8 +43,10 @@ DIGEST = RAW / "digest"
 CACHE = RAW / ".index.json"
 # 記録どうしのリンクのスクリプトと共有するロック。git の中（.git/）に置く（git に入らず、目にも触れない）
 LOCK = (HUB / ".git" / "hub-scripts.lock") if (HUB / ".git").is_dir() else (HUB / "records" / ".hub-scripts.lock")
-STALE_SEC = 180  # これより古いロックは、止められた実行が残したものとして外す（フックの上限 180 秒に合わせる）
-CACHE_VERSION = 3  # 読み方を変えたら上げる。上がると、すべての会話を一度読み直す
+# これより古いロックは、止められた実行が残したものとして外す。会話の終わりのフックは 60 秒ほどで止められ、
+# 手で動かした長い実行は 20 秒ごとにロックの時刻を新しくする（keep_lock）ので、これより古いものは確かに止まっている
+STALE_SEC = 90
+CACHE_VERSION = 4  # 読み方を変えたら上げる。上がると、すべての会話を一度読み直す
 SOURCES = HUB / "hub" / "session-sources.txt"
 PROJECTS = Path.home() / ".claude" / "projects"
 TRAILER = "Hub-Session"
@@ -105,41 +110,82 @@ def local(ts):
         return None
 
 
-def candidate_files(dirs):
-    """会話のファイル。Claude Code のフォルダにあるものを優先し、消えたもの（既定で 30 日）はハブに写した生の記録を使う。"""
+def mtime(f: Path) -> float:
+    try:
+        return f.stat().st_mtime
+    except OSError:
+        return -1.0
+
+
+def candidate_files(dirs, extra=()):
+    """会話のファイル。Claude Code のフォルダにあるものを優先し、消えたもの（既定で 30 日）はハブに写した生の記録を使う。
+    extra は、名前によらずに探すフォルダ（フックの標準入力の transcript_path があるフォルダ）。"""
     files = {}
+    folders = []
     if PROJECTS.exists():
         encs = [encode(d).lower() for d in dirs]  # Windows ではフォルダの名前の大文字・小文字がそろわないことがある
-        for p in PROJECTS.iterdir():
-            n = p.name.lower()
-            if p.is_dir() and any(n == e or n.startswith(e + "-") for e in encs):
-                for f in p.glob("*.jsonl"):
-                    old = files.get(f.stem)  # 同じ会話が二つのフォルダにあれば、新しい方を使う
-                    if old is None or f.stat().st_mtime > old.stat().st_mtime:
-                        files[f.stem] = f
+        try:
+            folders = [p for p in PROJECTS.iterdir()
+                       if any(p.name.lower() == e or p.name.lower().startswith(e + "-") for e in encs) and p.is_dir()]
+        except OSError:
+            folders = []
+    seen = {str(p.resolve()).lower() for p in folders}
+    for p in extra:
+        if str(p.resolve()).lower() not in seen:
+            folders.append(p)
+            seen.add(str(p.resolve()).lower())
+    for p in folders:
+        try:
+            found = list(p.glob("*.jsonl"))
+        except OSError:
+            continue
+        for f in found:
+            old = files.get(f.stem)  # 同じ会話が二つのフォルダにあれば、新しい方を使う
+            if old is None or mtime(f) > mtime(old):
+                files[f.stem] = f
     if RAW.exists():
         for f in RAW.glob("*.jsonl"):
             files.setdefault(f.stem, f)
     return list(files.values())
 
 
+def hook_transcript_dir(data: str):
+    """フックの標準入力（Claude Code が渡す JSON）の transcript_path から、会話のファイルのあるフォルダを返す。
+    読めなければ None（フォルダの名前で探すだけにする）。ハブをジャンクションやシンボリックリンクの先で開いたとき、
+    フォルダの名前の付け方が変わったときにも、その会話を拾うため。"""
+    try:
+        d = json.loads(data.lstrip(chr(0xFEFF)))  # 先頭の BOM を外す
+        t = d.get("transcript_path") if isinstance(d, dict) else None
+        if isinstance(t, str) and t.strip():
+            p = Path(os.path.expanduser(t.strip()))
+            if p.is_file():
+                return p.parent
+    except Exception:  # 形の違う入力は無視する
+        pass
+    return None
+
+
 def message_text(content):
     if isinstance(content, list):
-        return " ".join(x.get("text", "") for x in content if isinstance(x, dict) and x.get("type") == "text")
+        return " ".join(x["text"] for x in content
+                        if isinstance(x, dict) and x.get("type") == "text" and isinstance(x.get("text"), str))
     return content if isinstance(content, str) else ""
 
 
 def user_text(content):
     """研究者の発言の（本文, 種類）。先に <system-reminder> の囲みを除いてから、機械が足した行かを判定する。
-    種類は user（研究者の発言）か command（スラッシュコマンド）。コマンドは読める形に残すが、
-    研究者が話したかどうか（記録の対象か、要約が要るか）の判定には入れない（/exit や /clear で数えないため）。"""
+    種類は user（研究者の発言）か command（引数の無いスラッシュコマンド）。
+    引数のあるコマンド（「/harness-dispatch 実装を進めたい」）は研究者の発言として user にする。
+    引数の無いコマンドは読める形に残すが、研究者が話したかどうか（記録の対象か、要約が要るか）の判定には入れない
+    （/exit や /clear で数えないため）。"""
     t = REMINDER_RX.sub("", message_text(content)).strip()
     if not t:
         return "", None
     if "<command-name>" in t:
         name = re.search(r"<command-name>(.*?)</command-name>", t, re.S)
         args = re.search(r"<command-args>(.*?)</command-args>", t, re.S)
-        return " ".join(x.group(1).strip() for x in (name, args) if x and x.group(1).strip()), "command"
+        text = " ".join(x.group(1).strip() for x in (name, args) if x and x.group(1).strip())
+        return text, ("user" if args and args.group(1).strip() else "command")
     if t.startswith(SKIP_PREFIXES):
         return "", None
     return t, "user"
@@ -172,7 +218,8 @@ def ask_text(inp):
 
 def tool_result_text(c):
     if isinstance(c, list):
-        return " ".join(x.get("text", "") for x in c if isinstance(x, dict) and x.get("type") == "text")
+        return " ".join(x["text"] for x in c
+                        if isinstance(x, dict) and x.get("type") == "text" and isinstance(x.get("text"), str))
     return str(c or "")
 
 
@@ -185,19 +232,31 @@ def parse(path: Path):
         for line in fh:
             try:
                 d = json.loads(line)
-            except json.JSONDecodeError:
+            except (json.JSONDecodeError, RecursionError):
                 continue
+            if not isinstance(d, dict):
+                continue  # JSON でも、オブジェクトでない行（[] など）は読み飛ばす
             typ = d.get("type")
-            if typ == "custom-title" and d.get("customTitle"):
+            if typ == "custom-title" and isinstance(d.get("customTitle"), str) and d["customTitle"]:
                 title_c = d["customTitle"]
-            elif typ == "ai-title" and d.get("aiTitle"):
+            elif typ == "ai-title" and isinstance(d.get("aiTitle"), str) and d["aiTitle"]:
                 title_a = d["aiTitle"]
-            if d.get("cwd") and not cwd:
+            if isinstance(d.get("cwd"), str) and d["cwd"] and not cwd:
                 cwd = d["cwd"]
+            if not isinstance(d.get("timestamp"), str):
+                d["timestamp"] = None
+            if not isinstance(d.get("uuid"), str):
+                d["uuid"] = None
+            if not isinstance(d.get("sessionId"), str):
+                d["sessionId"] = None
             if typ == "attachment" and not d.get("isSidechain"):
                 # Claude が作業している間に研究者が送った発言。ほかの会話（peer）や作業の知らせは除く
-                a = d.get("attachment") or {}
-                origin = (a.get("origin") or {}).get("kind")
+                a = d.get("attachment")
+                a = a if isinstance(a, dict) else {}
+                o = a.get("origin")
+                origin = o.get("kind") if isinstance(o, dict) else None
+                if not isinstance(a.get("timestamp"), str):
+                    a["timestamp"] = None
                 if (a.get("type") == "queued_command" and a.get("commandMode") == "prompt"
                         and not a.get("isMeta") and origin in (None, "human")):
                     t, kind = user_text(a.get("prompt"))
@@ -209,8 +268,8 @@ def parse(path: Path):
             if d.get("isSidechain") or typ not in ("user", "assistant"):
                 continue
             ts, uuid, label = d.get("timestamp"), d.get("uuid"), d.get("sessionId") or sid
-            msg = d.get("message", {}) or {}
-            content = msg.get("content")
+            msg = d.get("message")
+            content = msg.get("content") if isinstance(msg, dict) else None
             if typ == "user":
                 if d.get("isCompactSummary"):
                     items.append({"uuid": uuid, "label": label, "kind": "note", "ts": ts, "text": "（ここで会話が要約され、続きの会話になった）"})
@@ -243,7 +302,7 @@ def parse(path: Path):
                         cur = {"uuid": uuid, "label": label, "kind": "claude", "ts": ts, "text": [], "tools": []}
                         items.append(cur)
                     cur["te"] = ts or cur.get("te")  # 返答が続いた最後の時刻（期間と、要約が要るかの判定に使う）
-                    if b["type"] == "text" and b.get("text", "").strip():
+                    if b["type"] == "text" and isinstance(b.get("text"), str) and b["text"].strip():
                         cur["text"].append(b["text"].strip())
                     elif b["type"] == "tool_use":
                         s = tool_summary(b)
@@ -349,11 +408,55 @@ AUTO_START = "<!-- auto:start（harness-session-archive が作る。人も Claud
 AUTO_START_RX = re.compile(r"^<!-- auto:start[^>\n]*-->[ \t]*$", re.M)
 AUTO_END = "<!-- auto:end -->"
 AUTO_END_RX = re.compile(r"^<!-- auto:end -->[ \t]*$", re.M)
+# auto_block() が囲みの中に書く行の形
+AUTO_LINE_RX = re.compile(r"^- (?:会話の ID|作業ディレクトリ|期間|分岐元|生の記録|読める形)："
+                          rf"|^- この会話でのハブのコミット（{re.escape(TRAILER)}）：[ \t]*$|^  - ")
+BROKEN_AUTO = "冒頭の囲みが崩れている"
+
+
+def find_auto(text: str):
+    """要約の冒頭の囲みを探す。戻り値：(始まり, 終わり) の位置、None（囲みが無い）、"broken"（崩れている）。
+    書き直してよいのは、このスクリプトが書いた形のものだけ（それ以外を置き換えると、人の書いた本文を消すため）。
+    - 始まりの印の行が、最初の「## 」の見出しより前にある（``` の中の行は数えない）
+    - その後、ほかの始まりの印より前に、終わりの印の行がある
+    - 間の行（空行を除く）が、どれも auto_block() の書く形
+    「## 」より後ろにだけ始まりの印の行があるときも、崩れているとする（囲みが動かされた）。"""
+    off, fence, start = 0, False, None
+    for line in text.split("\n"):
+        if start is None:
+            if line.lstrip().startswith(("```", "~~~")):
+                fence = not fence
+            elif not fence:
+                if AUTO_START_RX.match(line):
+                    start = off
+                elif line.startswith("## "):
+                    # 見出しより後ろの始まりの印は、冒頭の囲みとはみなさない
+                    rest = text[off:]
+                    return "broken" if _marker_outside_code(rest) else None
+        else:
+            if AUTO_END_RX.match(line):
+                return start, off + len(line)
+            if line.strip() and not AUTO_LINE_RX.match(line):
+                return "broken"  # 終わりの印が欠けた、またはスクリプトの書かない行がある
+        off += len(line) + 1
+    return "broken" if start is not None else None
+
+
+def _marker_outside_code(text: str) -> bool:
+    fence = False
+    for line in text.split("\n"):
+        if line.lstrip().startswith(("```", "~~~")):
+            fence = not fence
+        elif not fence and AUTO_START_RX.match(line):
+            return True
+    return False
 
 
 def no_marker(t: str) -> str:
     """件名や題に書かれた「<!--」を、囲みの印と取り違えない形にする（表示は同じ）。"""
     return t.replace("<!--", "&lt;!--")
+
+
 SUMMARY_BODY = """
 - 要約した範囲：（要約待ち）
 
@@ -395,7 +498,7 @@ def auto_block(s, r, parent, commits):
     if r["first"] and r["last"]:
         L.append(f"- 期間：{r['first']:%Y-%m-%d %H:%M} 〜 {r['last']:%Y-%m-%d %H:%M}")
     if parent:
-        L.append(f"- 分岐元：[{no_marker(redact(parent['title']))}]({parent['file']})")
+        L.append(f"- 分岐元：[{no_marker(redact(one_line(parent['title'], 200)))}]({parent['file']})")
     L += [f"- 生の記録：`records/sessions/raw/{s['id']}.jsonl`（git の外。この PC だけ）",
           f"- 読める形：`records/sessions/raw/digest/{s['id']}.md`（git の外）"]
     if commits:
@@ -545,6 +648,48 @@ def load_cache():
     return {k: v for k, v in c.items() if k == "_v" or (isinstance(v, dict) and isinstance(v.get("key"), list))}
 
 
+SUMMARY_FILE_RX = re.compile(r"^(\d{4}-\d{2}-\d{2})_([0-9a-f]{8})\.md$")
+ROW_RX = re.compile(r"^\| (?P<when>[^|]*) \|.*\| `(?P<id>[0-9a-f]{8})` \| \[(?P<file>[^\]]+)\]\(")
+UNREADABLE_STATE = "読めない（UTF-8 で保存し直す）"
+
+
+def other_rows(sessions, excludes, seen8, skipped):
+    """一覧の、いまの会話以外の行（並べる鍵, 行）。records/sessions/ にある要約のファイルの全部を載せる。
+    別の PC で開いた会話など、この PC で対象の会話に無いもの。除いた会話（「! <ID>」）は載せない。
+    前の一覧に行があればそれを使い（開始の時刻と題が分かるため）、無ければファイルから作る（一覧が消えても作り直せるように）。
+    この PC では要約が要るかを決められないので、「要約が要る」の印は付けない。"""
+    cur8 = {s["id"][:8] for s in sessions}
+    prev = {}
+    idx = OUT / "README.md"
+    for line in ((read_or_none(idx) or "").splitlines() if idx.exists() else []):
+        m = ROW_RX.match(line)
+        if m and UNREADABLE_STATE not in line:  # 読めなかった行は、ファイルから作り直す（直っているかもしれないため）
+            prev.setdefault(m.group("file"), (m.group("when").strip(), line.replace("（**要約が要る**）", "")))
+    out = []
+    for p in sorted(OUT.glob("*.md")):
+        m = SUMMARY_FILE_RX.match(p.name)
+        if not m:
+            continue
+        day, id8 = m.groups()
+        if id8 in cur8 or any(id8.startswith(x[:8]) for x in excludes):
+            continue
+        if p.name in prev:
+            out.append(prev[p.name])
+            continue
+        note = "（この PC では対象の外の会話）" if id8 in seen8 else "（この PC に会話の記録なし）"
+        text = read_or_none(p)
+        if text is None:
+            skipped.append((p.name, "読めない（UTF-8 でない、開けない）"))
+            out.append((day, f"| {day} | （読めない）{note} | `{id8}` | [{p.name}]({p.name}) | {UNREADABLE_STATE} |"))
+            continue
+        head = text.split("\n", 1)[0].strip()
+        title = head[len("# 会話の要約："):] if head.startswith("# 会話の要約：") else ""
+        title = one_line(title.strip() or p.stem, 200).replace("|", "／")
+        state = "要約しない" if NOT_SUMMARIZED_RX.search(text) else (summarized_until(text) or "未要約")
+        out.append((day, f"| {day} | {title}{note} | `{id8}` | [{p.name}]({p.name}) | {state} |"))
+    return out
+
+
 def main():
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8")
@@ -553,11 +698,16 @@ def main():
     ap.add_argument("--list", action="store_true")
     ap.add_argument("--pending", action="store_true")
     a = ap.parse_args()
+    extra = []  # 名前によらずに探す、会話のファイルのフォルダ
     if a.hook:
+        # Claude Code は、終わった会話の情報（transcript_path など）を JSON で渡す。読めなければ無視する
         try:
-            sys.stdin.read()
-        except OSError:
-            pass
+            data = sys.stdin.read()
+        except Exception:  # 標準入力が無い、閉じている、字が読めないなど
+            data = ""
+        d = hook_transcript_dir(data or "")
+        if d is not None:
+            extra.append(d)
     if not (HUB / "hub").exists():
         return  # 導入前のひな形では何もしない
     main_hub = main_hub_of_worktree()
@@ -586,12 +736,8 @@ def main():
         n = norm(cwd)
         return any(n == r or n.startswith(r + "\\") or n.startswith(r + "/") for r in roots)
 
-    sessions = []
-    for f in candidate_files(dirs):
-        keep_lock()
-        sid = f.stem
-        if any(sid.startswith(x) for x in excludes):
-            continue
+    def take(f, sid):
+        """会話のファイルを一つ読む。対象なら会話を返す（対象の外なら None）。"""
         st = f.stat()
         key = [st.st_size, int(st.st_mtime)]
         c = cache.get(sid)
@@ -600,29 +746,53 @@ def main():
         if c and c.get("key") == key:
             if "labels" in c:
                 if in_scope(c.get("cwd")):
-                    sessions.append({"id": sid, "path": f, "parsed": None, **c})
-                else:
-                    cache[sid] = {"key": key, "skip": True, "cwd": c.get("cwd"), "talk": True}
-                continue
+                    return {"id": sid, "path": f, "parsed": None, **c}
+                cache[sid] = {"key": key, "skip": True, "cwd": c.get("cwd"), "talk": True}
+                return None
             if c.get("skip") and "cwd" in c and not (c.get("talk") and in_scope(c["cwd"])):
-                continue
+                return None
         p = parse(f)
         talk = any(i["kind"] in ("user", "answer") for i in p["items"])
         if not talk or not in_scope(p["cwd"]):
             cache[sid] = {"key": key, "skip": True, "cwd": p["cwd"], "talk": talk}
-            continue
+            return None
         entry = {"key": key, "title": p["title"], "cwd": p["cwd"],
                  "uuids": [i["uuid"] for i in p["items"]], "labels": [i["label"] for i in p["items"]],
                  "kinds": [i["kind"] for i in p["items"]], "ts": [i["ts"] for i in p["items"]],
                  "te": [i.get("te") or i["ts"] for i in p["items"]], "changed": True}
         cache[sid] = entry
-        sessions.append({"id": sid, "path": f, "parsed": p, **entry})
+        return {"id": sid, "path": f, "parsed": p, **entry}
+
+    sessions = []
+    seen8 = set()  # この PC にある会話の記録（対象の外のものも含む）の、ID の先頭 8 文字
+    failed = []  # 読めなかった・写せなかった会話の記録（ほかの会話は続ける）
+    for f in candidate_files(dirs, extra):
+        keep_lock()
+        sid = f.stem
+        seen8.add(sid[:8])
+        if any(sid.startswith(x) for x in excludes):
+            continue
+        try:
+            s = take(f, sid)
+        except Exception as e:  # 1 つのファイルのせいで全体を止めない
+            cache.pop(sid, None)
+            failed.append((str(f), f"読めなかった：{type(e).__name__}"))
+            continue
+        if s is None:
+            continue
+        sessions.append(s)
         # 生の記録をハブに写す（一覧だけのときと、すでにハブの写しから読んだときは写さない）
-        if not a.list and f.resolve().parent != raw_dir:
-            copy_file(f, RAW / f.name)
+        if s["parsed"] is not None and not a.list:
+            try:
+                if f.resolve().parent != raw_dir:
+                    copy_file(f, RAW / f.name)
+            except Exception as e:
+                cache[sid].pop("key", None)  # 次の実行で読み直して、写し直す
+                failed.append((str(f), f"写せなかった：{type(e).__name__}"))
 
     if not a.hook:
-        seen = [norm(v["cwd"]) for k, v in cache.items() if k != "_v" and isinstance(v, dict) and v.get("cwd")]
+        seen = [norm(v["cwd"]) for k, v in cache.items()
+                if k != "_v" and isinstance(v, dict) and isinstance(v.get("cwd"), str) and v["cwd"]]
         hub_n = norm(str(HUB))
         idle = [d for d, r0 in zip(dirs, roots) if r0 != hub_n
                 and not any(c == r0 or c.startswith(r0 + "\\") or c.startswith(r0 + "/") for c in seen)]
@@ -644,6 +814,13 @@ def main():
         ids = [h[0] for h in hs]
         owner[u] = hs[0][1] if hs[0][1] in ids else ids[0]
 
+    # 要約のファイルの名前は、作るときに決めて変えない。あれば（*_<ID の先頭 8 文字>.md）その名前を使い続ける。
+    # 開始日は時間帯や分岐元が分かったことで変わりうるが、名前を変えるとリンクが切れるため
+    existing = {}
+    for p in OUT.glob("*_*.md"):
+        n = p.name
+        if len(n) > 12 and n[-12] == "_":
+            existing.setdefault(n[-11:-3], []).append(n)
     rows = {}
     for s in sessions:
         own = [i for i, u in enumerate(s["uuids"]) if owner.get(u) == s["id"]]
@@ -654,10 +831,11 @@ def main():
         first = local(ts_own[0]) if ts_own else None
         last = local(te_own[-1]) if te_own else None
         s["own_idx"] = own
+        have = sorted(existing.get(s["id"][:8], []))
         rows[s["id"]] = {"id": s["id"], "title": s.get("title", ""), "first": first, "last": last,
                          "last_talk": local(talk_own[-1]) if talk_own else None,
                          "cwd": s.get("cwd"), "n_own": len(own),
-                         "file": (f"{first:%Y-%m-%d}_{s['id'][:8]}.md" if first else None)}
+                         "file": have[0] if have else (f"{first:%Y-%m-%d}_{s['id'][:8]}.md" if first else None)}
 
     if a.list:
         for s in sessions:
@@ -691,41 +869,46 @@ def main():
         own_sig = hashlib.sha1(("\n".join(s["uuids"][i] or "" for i in s["own_idx"]) + "|" +
                                 (parent["file"] if parent else "")).encode("utf-8")).hexdigest()
         if s.get("changed") or not dg.exists() or cache[s["id"]].get("own_sig") != own_sig:
-            p = s["parsed"] or parse(s["path"])
-            own_set = {s["uuids"][i] for i in s["own_idx"]}
-            items = [i for i in p["items"] if i["uuid"] in own_set]
-            write_text(dg, render_digest(p, items, parent["title"] if parent else None))
-            cache[s["id"]]["own_sig"] = own_sig
-        # 要約のファイル：名前が変わっていたら移す（中身は Claude が書いたものなので消さない）
+            try:
+                p = s["parsed"] or parse(s["path"])
+                own_set = {s["uuids"][i] for i in s["own_idx"]}
+                items = [i for i in p["items"] if i["uuid"] in own_set]
+                write_text(dg, render_digest(p, items, parent["title"] if parent else None))
+                cache[s["id"]]["own_sig"] = own_sig
+            except Exception as e:  # 読める形が作れなくても、要約のファイルと一覧は続ける
+                cache[s["id"]].pop("own_sig", None)
+                failed.append((str(s["path"]), f"読める形を作れなかった：{type(e).__name__}"))
+        # 要約のファイル。名前は変えない（上の existing）。中身は Claude が書いたものなので消さない
         out = OUT / r["file"]
-        if not out.exists():
-            olds = [x for x in OUT.glob(f"*_{s['id'][:8]}.md") if x != out]
-            if olds:
-                olds[0].rename(out)
         block = auto_block(s, r, parent, commits_of.get(s["id"], []))
         text = None
         if out.exists():
             text = read_or_none(out)
             if text is None:
                 # 読めない要約（UTF-8 でない、開けない）は書き換えず、ほかの会話を続ける
-                skipped.append(r["file"])
+                skipped.append((r["file"], "読めない（UTF-8 でない、開けない）"))
                 r["until"], r["pending"] = "読めない（UTF-8 で保存し直す）", False
                 cache[s["id"]].pop("changed", None)
                 continue
-            m = AUTO_START_RX.search(text)
-            e = AUTO_END_RX.search(text, m.end()) if m else None
-            if m and e and git_ok:
-                new = text[: m.start()] + block + text[e.end():]
+            b = find_auto(text)
+            if b == "broken":
+                # 囲みが崩れている（終わりの印が欠けた、囲みの中に書き足した、見出しの後ろに動いた）。
+                # 置き換えると本文を消すおそれがあるので、触らずに知らせる。要約が要るかは、いまの本文で決める
+                skipped.append((r["file"], BROKEN_AUTO))
+                r["broken"] = True
+                new = text
+            elif b and git_ok:
+                new = text[: b[0]] + block + text[b[1]:]
             else:
-                new = text  # 囲みが無い・崩れている、または git が動かず、ハブのコミットの一覧が作れない
+                new = text  # 囲みが無い、または git が動かず、ハブのコミットの一覧が作れない
         else:
-            new = f"# 会話の要約：{no_marker(redact(r['title']))}\n\n{block}\n{summary_body()}"
+            new = f"# 会話の要約：{no_marker(redact(one_line(r['title'], 200)))}\n\n{block}\n{summary_body()}"
         if new != text:
             try:
                 write_text(out, new)
             except OSError:
                 # 書けない（ほかのプログラムが開いているなど）ときも、ほかの会話を続ける。次の実行でやり直す
-                skipped.append(r["file"])
+                skipped.append((r["file"], "書けなかった（次の実行でやり直す）"))
                 r["until"], r["pending"] = "書けなかった（次の実行でやり直す）", False
                 continue
         if NOT_SUMMARIZED_RX.search(new):
@@ -734,23 +917,14 @@ def main():
             continue
         until = summarized_until(new)
         r["until"] = until
-        # 要約が要るのは、要約した範囲の後に研究者の発言があるとき（Claude の最後の返答だけでは要らない）
+        # 要約が要るのは、要約した範囲の後に研究者の発言があるとき（Claude の最後の返答だけでは要らない）。
+        # 自分の発言が無い会話（中身はすべて分岐元にある）は要らない
         lt = r["last_talk"]
-        r["pending"] = (until is None) or (lt is not None and f"{lt:%Y-%m-%d %H:%M}" > until)
+        r["pending"] = r["n_own"] > 0 and ((until is None) or (lt is not None and f"{lt:%Y-%m-%d %H:%M}" > until))
         cache[s["id"]].pop("changed", None)
 
     rows_l = [rows[s["id"]] for s in sessions]
-    kept = []  # (並べる鍵, 行)
-    known8 = {k[:8] for k in cache if k != "_v"} | {s["id"][:8] for s in sessions}
-    if (OUT / "README.md").exists():
-        row_rx = re.compile(r"^\| (?P<when>[^|]*) \|.*\| `(?P<id>[0-9a-f]{8})` \| \[(?P<file>[^\]]+)\]\(")
-        for line in (read_or_none(OUT / "README.md") or "").splitlines():
-            m = row_rx.match(line)
-            # この PC が知らない会話（別の PC で開いた会話、生の記録がこの PC に無い会話）だけを残す。
-            # この PC が知っていて対象の外にした会話（除いた、場所を外した）は残さない
-            if (m and m.group("id") not in known8 and (OUT / m.group("file")).exists()
-                    and not any(m.group("id").startswith(x[:8]) for x in excludes)):
-                kept.append((m.group("when").strip(), line))
+    kept = other_rows(sessions, excludes, seen8, skipped)
     idx = ["# 会話の記録", "",
            "研究に関係する Claude Code の会話の要約。**履歴の記録**なので、書かれた決定はその時点のもの（現在の決定は `hub/decisions.md`）。",
            "", "- 対象：`hub/session-sources.txt` の作業ディレクトリで開いた会話",
@@ -764,10 +938,11 @@ def main():
         start = local(first_ts(s))
         key = f"{r['first']:%Y-%m-%d %H:%M}" if r["first"] else (f"{start:%Y-%m-%d %H:%M}" if start else "")
         when = f"{r['first']:%Y-%m-%d %H:%M}" if r["first"] else ""
-        title = redact(r["title"]).replace("|", "／") + ("（分岐）" if r.get("parent") else "")
+        title = redact(one_line(r["title"], 200)).replace("|", "／") + ("（分岐）" if r.get("parent") else "")
         if r["file"]:
             link = f"[{r['file']}]({r['file']})"
-            state = (r.get("until") or "未要約") + ("（**要約が要る**）" if r.get("pending") else "")
+            state = ((r.get("until") or "未要約") + ("（**要約が要る**）" if r.get("pending") else "")
+                     + (f"（{BROKEN_AUTO}）" if r.get("broken") else ""))
         else:
             par = r.get("parent")
             link = f"自分の発言なし。中身は [{par['file']}]({par['file']})" if par else "自分の発言なし"
@@ -780,14 +955,22 @@ def main():
     pend = [r for r in rows_l if r.get("pending")]
     if a.pending:
         for r in pend:
+            lt = r["last_talk"] or r["last"]
             print(f"{r['id'][:8]}  要約：records/sessions/{r['file']}  読める形：records/sessions/raw/digest/{r['id']}.md  "
-                  f"要約した範囲：{r.get('until') or 'なし'}  最後の発言：{(r['last_talk'] or r['last']):%Y-%m-%d %H:%M}")
+                  f"要約した範囲：{r.get('until') or 'なし'}  最後の発言：{f'{lt:%Y-%m-%d %H:%M}' if lt else 'なし'}")
     elif not a.hook:
         print(f"会話 {len(rows_l)} 件を更新した。要約が要る会話：{len(pend)} 件（--pending で一覧）")
     if skipped and not a.hook:
-        print("次の要約のファイルは、読めない（UTF-8 でない、開けない）か書けなかったので、触っていない：")
-        for f in skipped:
-            print(f"  records/sessions/{f}")
+        print("次の要約のファイルは触っていない：")
+        for f, why in skipped:
+            print(f"  records/sessions/{f}（{why}）")
+        if any(why == BROKEN_AUTO for _, why in skipped):
+            print(f"  {BROKEN_AUTO}ときは、冒頭の <!-- auto:start … --> 〜 <!-- auto:end --> を消して"
+                  "（書き足した行は本文に移す）、最初の「## 」の見出しより前に印の 2 行だけを置けば、次から書き直される")
+    if failed and not a.hook:
+        print("次の会話の記録は飛ばした（ほかの会話は続けた）：")
+        for f, why in failed:
+            print(f"  {f}（{why}）")
     if not git_ok and not a.hook:
         print("git が動かなかったので、要約の冒頭の囲み（ハブのコミットの一覧など）は書き換えなかった")
 

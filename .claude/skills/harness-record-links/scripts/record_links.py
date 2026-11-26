@@ -3,8 +3,10 @@
 書くのは、各記録の「関連」の欄（その記録から先へのリンク）だけ（その記録を書いた会話の Claude が書く）。このスクリプトがそこから作る：
 
 - 各記録の末尾の「この記録を指しているもの（自動）」の囲み（<!-- links:start --> 〜 <!-- links:end -->）。
-  囲みとみなすのは、その見出しのすぐ後の最後の印だけ。本文やコードの中で印に触れても、囲みとはみなさない。
-  見出しと印の組が崩れていれば、書き込まずに知らせる
+  囲みとみなすのは、その見出しの行のすぐ後に、印の行で始まり印の行で終わり、中がこのスクリプトの書く形の行だけのもの。
+  本文やコードの中で印に触れても、囲みとはみなさない。
+  見出しと印の組が崩れている（印の片方が欠けた、見出しを書き換えた、囲みの中に書き足した、囲みが二つある）なら、
+  書き込まずに知らせる。どの場合も、スクリプトの書いた行は、その記録のリンクとして数えない
 - records/links.md：記録ごとに「指しているもの」「指されているもの」。切れたリンクも出す
 - chats/README.md：文字起こしの一覧と、それぞれを使った相談・会話・決定など
 
@@ -42,10 +44,13 @@ from urllib.parse import unquote
 HUB = Path(__file__).resolve().parents[4]
 # 会話の記録のスクリプトと共有するロック。git の中（.git/）に置く（git に入らず、目にも触れない）
 LOCK = (HUB / ".git" / "hub-scripts.lock") if (HUB / ".git").is_dir() else (HUB / "records" / ".hub-scripts.lock")
-STALE_SEC = 180  # これより古いロックは、止められた実行が残したものとして外す（フックの上限 180 秒に合わせる）
+# これより古いロックは、止められた実行が残したものとして外す。会話の終わりのフックは 60 秒ほどで止められ、
+# 会話の記録のスクリプトは長く動くあいだ 20 秒ごとにロックの時刻を新しくするので、これより古いものは確かに止まっている
+STALE_SEC = 90
 # 会話の要約の「決まったこと」などの印（同じ秒が重なったときの -2 なども）
 ANCHOR_ID_RX = re.compile(r"^[a-z]{1,3}-\d{8}-\d{6}(?:-\d+)?$")
-LINK_RX = re.compile(r"\]\((<[^>\n]+>|[^)\s]+)\)")
+# リンクの先。<…> で囲まないときは、一段までの対になった括弧を含めてよい（../2026-01-18_D(1)/README.md）
+LINK_RX = re.compile(r"\]\((<[^>\n]+>|(?:[^()\s]|\([^()\s]*\))+)\)")
 TAIL_RX = re.compile(r"(?:/README\.md)?(?:#([A-Za-z0-9_-]+))?")  # 印は英数字だけ（後ろに続く日本語を印に含めない）
 BARE_RX = re.compile(r"(?<![\w/.-])records/(?:sessions|meetings|experiments|history)/[^\s`)>|、。<>\[\]*…{}]+")
 FENCE_RX = re.compile(r"^(```|~~~).*?^\1[^\n]*$", re.S | re.M)
@@ -70,64 +75,122 @@ def mask_code(text: str) -> str:
     return INLINE_CODE_RX.sub(lambda m: " " * len(m.group(0)), t)
 
 
-HEAD_LINE_RX = re.compile(rf"^{re.escape(HEAD)}[ \t]*$", re.M)
 # このスクリプトが囲みの中に書く行の形（「- 相談：…」など）
 GENERATED_LINE_RX = re.compile(r"^- (?:%s)：|^- （まだ無い）[ \t]*$" % "|".join(map(re.escape, KIND_ORDER)))
 
 
-def looks_generated(lines) -> bool:
-    return all(GENERATED_LINE_RX.match(ln) for ln in lines if ln.strip())
+def analyze(text: str):
+    """自動の囲みを、行ごとに見て探す。戻り値：(囲みの行の組 [(始まりの行, 終わりの行)], 崩れているか, 読み飛ばす行, 行)。
+    印と見出しとみなすのは、コード（``` の囲みと `…`）の外で、その行がそれだけのものだけ。文の中で触れた印は印ではない。
+    始まりの印の行ごとに、その後の最初の終わりの印の行まで（無ければ、次の始まりの印の行か終わりまで）を見る。
+    - 終わりがあり、中が空行とスクリプトの書く形の行だけで、前の行（空行を除く）が見出し → 囲み
+    - 終わりがあり、中がスクリプトの書く形の行だけで、見出しが前に無い（見出しを書き換えた）→ 崩れている
+    - 終わりがあり、スクリプトの書く形の行と、ほかの行が混ざる（囲みの中に書き足した）→ 崩れている
+    - 終わりがあり、中にスクリプトの書く形の行が無い（本文に書いた例）、または空で見出しも無い → 本文
+    - 終わりが無く、始まりの後の最初の行（空行を除く）がスクリプトの書く形 → 崩れている。そうでなければ本文
+    見出しの次の行（空行を除く）が始まりの印でなく、スクリプトの書く形の行か終わりの印なら、始まりの印が消えた → 崩れている。
+    読み飛ばす行は、囲みと崩れた囲みの、見出し・印・スクリプトの書いた行（人の書いた行は読む）。"""
+    lines = text.split("\n")
+    masked = mask_code(text).split("\n")
+    kinds = []
+    for o, m in zip(lines, masked):
+        s = m.strip()
+        if START_RX.fullmatch(s):
+            kinds.append("start")
+        elif s == END:
+            kinds.append("end")
+        elif s == HEAD:
+            kinds.append("head")
+        elif GENERATED_LINE_RX.match(m):
+            kinds.append("gen")
+        elif not o.strip():
+            kinds.append("blank")
+        else:
+            kinds.append("other")  # コードの中の行も、人の書いた行
+    n = len(kinds)
+    blocks, broken, skip = [], False, set()
+
+    def prev_nonblank(i):
+        i -= 1
+        while i >= 0 and kinds[i] == "blank":
+            i -= 1
+        return i
+
+    def next_nonblank(i):
+        i += 1
+        while i < n and kinds[i] == "blank":
+            i += 1
+        return i
+
+    for s in range(n):
+        if kinds[s] != "start":
+            continue
+        e = s + 1
+        while e < n and kinds[e] not in ("start", "end"):
+            e += 1
+        inner = range(s + 1, e)
+        gens = [i for i in inner if kinds[i] == "gen"]
+        others = [i for i in inner if kinds[i] in ("other", "head")]
+        p = prev_nonblank(s)
+        headed = p >= 0 and kinds[p] == "head"
+        if e < n and kinds[e] == "end":
+            if not others and headed:
+                blocks.append((s, e))
+            elif not gens:
+                continue  # 本文に書いた例、または見出しの無い空の組
+            else:
+                broken = True  # 見出しを書き換えた、または囲みの中に書き足した
+            skip.update([s, e, *gens])
+            if headed:
+                skip.add(p)
+        else:
+            j = next_nonblank(s)
+            if j < e and kinds[j] == "gen":
+                broken = True  # 終わりの印が消えた
+                skip.add(s)
+                if headed:
+                    skip.add(p)
+                while j < e and kinds[j] in ("blank", "gen"):
+                    if kinds[j] == "gen":
+                        skip.add(j)
+                    j += 1
+    for h in range(n):
+        if kinds[h] != "head":
+            continue
+        j = next_nonblank(h)
+        if j < n and kinds[j] in ("gen", "end"):
+            broken = True  # 始まりの印が消えた
+            skip.add(h)
+            while j < n and kinds[j] in ("blank", "gen"):
+                if kinds[j] == "gen":
+                    skip.add(j)
+                j += 1
+            if j < n and kinds[j] == "end":
+                skip.add(j)
+    return blocks, broken, skip, lines
 
 
 def find_block(text: str):
-    """自動の囲みを探す。戻り値：(見出しの始まり, 囲みの始まり, 囲みの終わり)、None（まだ無い）、"broken"（崩れている）。
-    囲みとみなすのは、次をすべて満たすものだけ（最後のものを採る）。
-    - コードの外にある
-    - 見出しのすぐ後に、始まりの印がある
-    - 終わりの印までの中身が、このスクリプトの書く形の行だけ
-    本文で印に触れた所や、本文に書いた囲みの例は、囲みとみなさない（置き換えると本文を消してしまうため）。
-    スクリプトが書いた行が残っているのに印の組が欠けているときは、崩れているとして書き込まない。"""
-    t = mask_code(text)
-    for m in reversed(list(START_RX.finditer(t))):
-        heads = [h for h in HEAD_LINE_RX.finditer(t, 0, m.start())]
-        if not heads or t[heads[-1].end():m.start()].strip():
-            continue
-        j = t.find(END, m.end())
-        if j < 0:
-            # 終わりの印が無い。すぐ後ろがスクリプトの書いた行なら、崩れた囲み。そうでなければ本文
-            after = [ln for ln in text[m.end():].splitlines() if ln.strip()][:1]
-            if after and looks_generated(after):
-                return "broken"
-            continue
-        inner = [ln for ln in text[m.end():j].splitlines() if ln.strip()]
-        if looks_generated(inner):
-            return heads[-1].start(), m.start(), j + len(END)
-        if any(GENERATED_LINE_RX.match(ln) for ln in inner):
-            # スクリプトの書いた行に、人の書いた行が混ざっている（囲みの中に書き足した）。
-            # 置き換えると人の行が消え、本文とみなすと逆向きのリンクをこの記録のリンクと数えてしまうので、触らずに知らせる
-            return "broken"
-    # 始まりの印が消えた囲み：見出しのすぐ後ろに、スクリプトの書いた行か終わりの印がある
-    for h in HEAD_LINE_RX.finditer(t):
-        after = [ln for ln in text[h.end():].splitlines() if ln.strip()][:1]
-        if after and (after[0].strip() == END or looks_generated(after)):
-            return "broken"
-    return None
+    """自動の囲みを探す。戻り値：(囲みの始まり, 囲みの終わり) の位置（元の text の中）、None（まだ無い）、"broken"（崩れている）。
+    崩れている、または囲みが二つ以上あるときは "broken"（どれを置き換えてよいか分からないので、書き込まずに知らせる）。"""
+    blocks, broken, _, lines = analyze(text)
+    if broken or len(blocks) > 1:
+        return "broken"
+    if not blocks:
+        return None
+    s, e = blocks[0]
+    start = sum(len(x) + 1 for x in lines[:s])
+    end = sum(len(x) + 1 for x in lines[:e]) + len(lines[e])
+    return start, end
 
 
 def strip_generated(text: str) -> str:
-    """自動で書いた囲み（このスクリプトの逆向きのリンク）を読み飛ばす。崩れた囲みでは、スクリプトの書いた行だけを読み飛ばす。"""
-    b = find_block(text)
-    if b is None:
+    """このスクリプトが書いた逆向きのリンク（囲みと崩れた囲みの、見出し・印・スクリプトの書いた行）を読み飛ばす。
+    囲みの外の、同じ形の行（「関連」の欄の「- 相談：…」）は本文として読む。"""
+    _, _, skip, lines = analyze(text)
+    if not skip:
         return text
-    if b == "broken":
-        # 最後の見出しより後ろの、スクリプトの書いた行と印だけを読み飛ばす（その前の「関連」の欄は、同じ形でも本文）
-        heads = list(HEAD_LINE_RX.finditer(mask_code(text)))
-        if not heads:
-            return text
-        tail = [ln for ln in text[heads[-1].end():].splitlines()
-                if not (GENERATED_LINE_RX.match(ln) or START_RX.fullmatch(ln.strip()) or ln.strip() == END)]
-        return text[:heads[-1].start()] + "\n".join(tail)
-    return text[:b[0]] + text[b[2]:]
+    return "\n".join("" if i in skip else x for i, x in enumerate(lines))
 
 
 def collect_nodes():
@@ -517,7 +580,7 @@ def main():
                 broken_blocks.append(n)  # 読んだ後に崩れた
             continue
         if b:
-            new = text[:b[1]] + block + text[b[2]:]
+            new = text[:b[0]] + block + text[b[1]:]
         else:
             new = text.rstrip("\n") + f"\n\n{HEAD}\n\n{block}\n"
         if new != text:
@@ -538,8 +601,9 @@ def main():
         L += [f"- `{n}`" for n in sorted(set(unreadable))] + [""]
     if broken_blocks:
         L += ["## 末尾の囲みが崩れている記録", "",
-              "末尾の「この記録を指しているもの（自動）」の見出しと囲みの印（始まりと終わり）の組が崩れているので、書き込んでいない。"
-              "見出しから囲みの終わりまでを消せば、次に作り直したときに新しく足される。", ""]
+              "末尾の「この記録を指しているもの（自動）」の見出しと囲みの印（始まりと終わり）の組が崩れているので、書き込んでいない"
+              "（印の片方が欠けた、見出しを書き換えた、囲みの中に書き足した、囲みが二つある）。"
+              "見出しから囲みの終わりまでを消せば（書き足した行は本文に移す）、次に作り直したときに新しく足される。", ""]
         L += [f"- `{n}`" for n in broken_blocks] + [""]
     if unlinked:
         L += ["## 相談の記録につながっていない文字起こし", "",

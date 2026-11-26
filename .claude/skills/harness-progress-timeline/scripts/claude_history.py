@@ -48,7 +48,8 @@ def local_time(ts: str) -> datetime | None:
 def clean(content) -> str:
     """先に <system-reminder> の囲みを除いてから、機械が足した行かを判定する。"""
     if isinstance(content, list):  # tool_result だけの行は本文が無い
-        t = " ".join(x.get("text", "") for x in content if isinstance(x, dict) and x.get("type") == "text")
+        t = " ".join(x["text"] for x in content
+                     if isinstance(x, dict) and x.get("type") == "text" and isinstance(x.get("text"), str))
     else:
         t = content if isinstance(content, str) else ""
     t = REMINDER_RX.sub("", t).strip()
@@ -71,25 +72,35 @@ def user_text(d: dict) -> str:
     if d.get("isSidechain"):
         return ""  # サブエージェントへの指示は、研究者の発言ではない
     if d.get("type") == "attachment":
-        a = d.get("attachment") or {}
-        origin = (a.get("origin") or {}).get("kind")
+        a = d.get("attachment")
+        a = a if isinstance(a, dict) else {}
+        o = a.get("origin")
+        origin = o.get("kind") if isinstance(o, dict) else None
         if (a.get("type") == "queued_command" and a.get("commandMode") == "prompt"
                 and not a.get("isMeta") and origin in (None, "human")):
             return clean(a.get("prompt"))
         return ""
     if d.get("type") != "user" or d.get("isMeta") or d.get("isCompactSummary"):
         return ""
-    return clean((d.get("message") or {}).get("content"))
+    m = d.get("message")
+    return clean(m.get("content") if isinstance(m, dict) else None)
+
+
+def records(fh):
+    """履歴の行を順に読む。JSON でない行と、JSON でもオブジェクトでない行（[] など）は読み飛ばす。"""
+    for line in fh:
+        try:
+            d = json.loads(line)
+        except (json.JSONDecodeError, RecursionError):
+            continue
+        if isinstance(d, dict):
+            yield d
 
 
 def first_cwd(f: Path):
     with open(f, encoding="utf-8", errors="replace") as fh:
-        for line in fh:
-            try:
-                d = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if d.get("cwd"):
+        for d in records(fh):
+            if isinstance(d.get("cwd"), str) and d["cwd"]:
                 return d["cwd"]
     return None
 
@@ -99,18 +110,14 @@ def scan(files):
     for f in files:
         sid = f.stem[:8]
         with open(f, encoding="utf-8", errors="replace") as fh:
-            for line in fh:
-                try:
-                    d = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
+            for d in records(fh):
                 t = user_text(d)
                 if not t:
                     continue
                 dt = local_time(d.get("timestamp", ""))
                 if dt is None:
                     continue
-                u = d.get("uuid")
+                u = d.get("uuid") if isinstance(d.get("uuid"), str) else None
                 if u:
                     if u in seen_uuid:
                         continue
@@ -143,7 +150,18 @@ def cmd_list(base: Path):
             continue
         mt = [datetime.fromtimestamp(j.stat().st_mtime) for j in js]
         size = sum(j.stat().st_size for j in js) / 1e6
-        print(f"{p.name}\n    会話 {len(js)}、{size:.1f} MB、最終更新 {min(mt):%Y-%m-%d} 〜 {max(mt):%Y-%m-%d}")
+        # フォルダの名前からは元のパスに戻せない（記号がすべて - になる）ので、会話に記録された作業ディレクトリを出す。
+        # hub/session-sources.txt にそのまま写せるように。新しい会話から順に、記録のあるものを使う
+        cwd = None
+        for j in sorted(js, key=lambda x: x.stat().st_mtime, reverse=True):
+            try:
+                cwd = first_cwd(j)
+            except OSError:
+                cwd = None
+            if cwd:
+                break
+        print(f"{p.name}\n    会話 {len(js)}、{size:.1f} MB、最終更新 {min(mt):%Y-%m-%d} 〜 {max(mt):%Y-%m-%d}"
+              f"\n    作業ディレクトリ: {cwd or '不明'}")
 
 
 def main():
@@ -151,7 +169,7 @@ def main():
         sys.stdout.reconfigure(encoding="utf-8")
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--base", type=Path, default=Path.home() / ".claude" / "projects")
-    ap.add_argument("--list", action="store_true", help="履歴のあるフォルダの一覧を出す")
+    ap.add_argument("--list", action="store_true", help="履歴のあるフォルダと、そこで開いた作業ディレクトリの一覧を出す")
     ap.add_argument("--project", help="Claude Code を開いていた作業ディレクトリ")
     ap.add_argument("--subdirs", action="store_true", help="その下のフォルダ・ワークツリーで開いた会話も含める")
     ap.add_argument("--since")
