@@ -20,6 +20,7 @@
   python -X utf8 session_archive.py --list     （対象の会話を一覧するだけ）
 """
 import argparse
+import atexit
 import hashlib
 import json
 import os
@@ -27,6 +28,8 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -35,7 +38,8 @@ OUT = HUB / "records" / "sessions"
 RAW = OUT / "raw"
 DIGEST = RAW / "digest"
 CACHE = RAW / ".index.json"
-CACHE_VERSION = 2  # 読み方を変えたら上げる。上がると、すべての会話を一度読み直す
+LOCK = RAW / ".lock"
+CACHE_VERSION = 3  # 読み方を変えたら上げる。上がると、すべての会話を一度読み直す
 SOURCES = HUB / "hub" / "session-sources.txt"
 PROJECTS = Path.home() / ".claude" / "projects"
 TRAILER = "Hub-Session"
@@ -47,7 +51,8 @@ SKIP_PREFIXES = (
 )
 CHORE_RX = re.compile(r"^chore\((sessions|links)\)!?:")
 SECRET = [
-    (re.compile(r"[\w.+-]+@[\w-]+\.[\w.-]+"), "<メールアドレス>"),
+    # 英数字だけで、前半は 64 字まで（日本語は \w に入るので、長い日本語の並びを読みに行かないように）
+    (re.compile(r"(?<![A-Za-z0-9._%+-])[A-Za-z0-9._%+-]{1,64}@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+"), "<メールアドレス>"),
     (re.compile(r"\b(sk-ant-[\w-]{10,}|sk-[\w-]{20,}|ghp_\w{20,}|github_pat_\w{20,}|xox[abpr]-[\w-]{10,})"), "<秘密の値>"),
 ]
 
@@ -102,7 +107,9 @@ def candidate_files(dirs):
             n = p.name.lower()
             if p.is_dir() and any(n == e or n.startswith(e + "-") for e in encs):
                 for f in p.glob("*.jsonl"):
-                    files[f.stem] = f
+                    old = files.get(f.stem)  # 同じ会話が二つのフォルダにあれば、新しい方を使う
+                    if old is None or f.stat().st_mtime > old.stat().st_mtime:
+                        files[f.stem] = f
     if RAW.exists():
         for f in RAW.glob("*.jsonl"):
             files.setdefault(f.stem, f)
@@ -116,17 +123,19 @@ def message_text(content):
 
 
 def user_text(content):
-    """研究者の発言の本文。先に <system-reminder> の囲みを除いてから、機械が足した行かを判定する。"""
+    """研究者の発言の（本文, 種類）。先に <system-reminder> の囲みを除いてから、機械が足した行かを判定する。
+    種類は user（研究者の発言）か command（スラッシュコマンド）。コマンドは読める形に残すが、
+    研究者が話したかどうか（記録の対象か、要約が要るか）の判定には入れない（/exit や /clear で数えないため）。"""
     t = REMINDER_RX.sub("", message_text(content)).strip()
     if not t:
-        return ""
-    if "<command-name>" in t:  # スラッシュコマンド：コマンドの名前と引数を残す
+        return "", None
+    if "<command-name>" in t:
         name = re.search(r"<command-name>(.*?)</command-name>", t, re.S)
         args = re.search(r"<command-args>(.*?)</command-args>", t, re.S)
-        return " ".join(x.group(1).strip() for x in (name, args) if x and x.group(1).strip())
+        return " ".join(x.group(1).strip() for x in (name, args) if x and x.group(1).strip()), "command"
     if t.startswith(SKIP_PREFIXES):
-        return ""
-    return t
+        return "", None
+    return t, "user"
 
 
 def one_line(s, n=120):
@@ -184,9 +193,9 @@ def parse(path: Path):
                 origin = (a.get("origin") or {}).get("kind")
                 if (a.get("type") == "queued_command" and a.get("commandMode") == "prompt"
                         and not a.get("isMeta") and origin in (None, "human")):
-                    t = user_text(a.get("prompt"))
+                    t, kind = user_text(a.get("prompt"))
                     if t:
-                        items.append({"uuid": d.get("uuid"), "label": d.get("sessionId") or sid, "kind": "user",
+                        items.append({"uuid": d.get("uuid"), "label": d.get("sessionId") or sid, "kind": kind,
                                       "ts": d.get("timestamp") or a.get("timestamp"), "text": t, "queued": True})
                         cur = None
                 continue
@@ -209,9 +218,9 @@ def parse(path: Path):
                             items.append({"uuid": f"{uuid}-a", "label": label, "kind": "answer", "ts": ts,
                                           "text": ask_ids[x["tool_use_id"]] + "\n- 研究者の回答：" + one_line(ans, 2000)})
                             cur = None
-                t = user_text(content)
+                t, kind = user_text(content)
                 if t and not t.startswith("This session is being continued"):
-                    items.append({"uuid": uuid, "label": label, "kind": "user", "ts": ts, "text": t})
+                    items.append({"uuid": uuid, "label": label, "kind": kind, "ts": ts, "text": t})
                     cur = None
             else:
                 if not isinstance(content, list):
@@ -237,9 +246,20 @@ def parse(path: Path):
         if it["kind"] == "claude":
             it["text"] = "\n\n".join(it["text"])
     items = [it for it in items if it["kind"] != "claude" or it["text"] or it["tools"]]
-    # 作業中に送った発言は、あとで普通の発言としても記録されることがある。同じ本文があれば、その方を残す
-    said = {re.sub(r"\s+", " ", i["text"]).strip() for i in items if i["kind"] == "user" and not i.get("queued")}
-    items = [i for i in items if not (i.get("queued") and re.sub(r"\s+", " ", i["text"]).strip() in said)]
+    # 作業中に送った発言は、あとで普通の発言としても記録されることがある。
+    # 同じ会話（label）で、前後 10 分以内に同じ本文の普通の発言があれば、普通の発言の方を残す
+    said = {}
+    for i in items:
+        if i["kind"] in ("user", "command") and not i.get("queued"):
+            said.setdefault((i["label"], re.sub(r"\s+", " ", i["text"]).strip()), []).append(local(i["ts"]))
+
+    def dup(i):
+        if not i.get("queued"):
+            return False
+        t0 = local(i["ts"])
+        others = said.get((i["label"], re.sub(r"\s+", " ", i["text"]).strip()), [])
+        return any(t0 is None or x is None or abs((x - t0).total_seconds()) < 600 for x in others)
+    items = [i for i in items if not dup(i)]
     title = title_c or title_a or next((one_line(i["text"], 40) for i in items if i["kind"] == "user"), sid[:8])
     times = [local(i.get("te") or i["ts"]) for i in items]
     first = next((local(i["ts"]) for i in items if local(i["ts"])), None)
@@ -301,9 +321,9 @@ def render_digest(s, items, parent_title):
             day = f"{dt:%Y-%m-%d}"
             L += [f"## {day}", ""]
         hm = f"{dt:%H:%M:%S}" if dt else "--:--:--"
-        who = {"user": "研究者", "answer": "選択肢での質問と回答", "note": "注記", "claude": "Claude"}[it["kind"]]
+        who = {"user": "研究者", "command": "研究者のコマンド", "answer": "選択肢での質問と回答", "note": "注記", "claude": "Claude"}[it["kind"]]
         L += [f"### {hm} {who}", f"<!-- uuid: {it['uuid']} -->", ""]
-        if it["kind"] == "user":
+        if it["kind"] in ("user", "command"):
             L += [quote(redact(it["text"])), ""]
         elif it["kind"] in ("answer", "note"):
             L += [redact(it["text"]), ""]
@@ -360,22 +380,101 @@ def auto_block(s, r, parent, commits):
     return "\n".join(L)
 
 
+NOT_SUMMARIZED_RX = re.compile(r"^- 要約した範囲：\s*要約しない", re.M)
+
+
 def summarized_until(text):
-    m = re.search(r"^- 要約した範囲：.*?(\d{4}-\d{2}-\d{2}) (\d{1,2}):(\d{2})", text, re.M)
-    return f"{m.group(1)} {int(m.group(2)):02d}:{m.group(3)}" if m else None
+    """「要約した範囲」の行の、最後の日時（「A 〜 B」なら B）。"""
+    m = re.search(r"^- 要約した範囲：(.*)$", text, re.M)
+    if not m:
+        return None
+    found = re.findall(r"(\d{4}-\d{2}-\d{2}) (\d{1,2}):(\d{2})", m.group(1))
+    if not found:
+        return None
+    d, h, mi = found[-1]
+    return f"{d} {int(h):02d}:{mi}"
 
 
-def is_linked_worktree():
-    """ハブのワークツリー（.claude/worktrees/ など）の中で動いているか。そのときは何も書かない。
-    そこで開いた会話は、元のハブで動くときに、ハブの下の会話として取り込まれる。"""
-    return (HUB / ".git").is_file()
+def main_hub_of_worktree():
+    """ハブのワークツリーの中で動いているなら、元のハブのフォルダを返す（そうでなければ None）。
+    サブモジュールや --separate-git-dir のハブは、ワークツリーとはみなさない。"""
+    try:
+        r = subprocess.run(["git", "-C", str(HUB), "rev-parse", "--absolute-git-dir", "--git-common-dir"],
+                           capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    lines = r.stdout.split("\n")
+    if r.returncode != 0 or len(lines) < 2 or not lines[1].strip():
+        return None
+    git_dir = Path(lines[0].strip()).resolve()
+    common = Path(lines[1].strip())
+    common = (common if common.is_absolute() else HUB / common).resolve()
+    return common.parent if git_dir != common else None
 
 
 def write_text(path: Path, text: str):
-    """改行は LF にそろえ、一時ファイルに書いてから入れ替える（途中で止まっても壊れたファイルを残さない）。"""
-    tmp = path.with_name(path.name + ".tmp")
-    tmp.write_text(text, encoding="utf-8", newline="\n")
-    os.replace(tmp, path)
+    """改行は LF にそろえ、その都度ちがう名前の一時ファイルに書いてから入れ替える。
+    途中で止まっても壊れたファイルを残さず、同時に動いた別の会話のフックともぶつからない。"""
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(text)
+        replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def replace(tmp, path):
+    """入れ替える。Windows では、ほかのプログラムが一瞬開いていると失敗するので、数回やり直す。"""
+    for i in range(10):
+        try:
+            os.replace(tmp, path)
+            return
+        except PermissionError:
+            if i == 9:
+                raise
+            time.sleep(0.2)
+
+
+def acquire_lock(wait=120):
+    """同時に動いた別の会話のフックと、順番に動くためのロック。止まった実行が残したもの（10 分より古い）は外す。"""
+    deadline = time.time() + wait
+    while True:
+        try:
+            fd = os.open(LOCK, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            os.write(fd, str(os.getpid()).encode("ascii"))
+            os.close(fd)
+            atexit.register(lambda: LOCK.unlink(missing_ok=True))
+            return True
+        except FileExistsError:
+            try:
+                if time.time() - LOCK.stat().st_mtime > 600:
+                    LOCK.unlink(missing_ok=True)
+                    continue
+            except OSError:
+                pass
+            if time.time() > deadline:
+                return False
+            time.sleep(0.2)
+
+
+def copy_file(src: Path, dst: Path):
+    """生の記録を写す。一時ファイルに写してから入れ替える（会話のファイルが消えた後は、これが唯一の写しになるため）。"""
+    fd, tmp = tempfile.mkstemp(dir=dst.parent, prefix=f".{dst.name}.", suffix=".tmp")
+    os.close(fd)
+    try:
+        shutil.copy2(src, tmp)
+        replace(tmp, dst)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def load_cache():
@@ -385,7 +484,8 @@ def load_cache():
         return {}  # 無い、または壊れている：すべてを読み直す
     if not isinstance(c, dict) or c.get("_v") != CACHE_VERSION:
         return {}
-    return c
+    # 中身の形がおかしい項目は捨てる（その会話は読み直す）
+    return {k: v for k, v in c.items() if k == "_v" or (isinstance(v, dict) and isinstance(v.get("key"), list))}
 
 
 def main():
@@ -403,12 +503,22 @@ def main():
             pass
     if not (HUB / "hub").exists():
         return  # 導入前のひな形では何もしない
-    if is_linked_worktree():
+    main_hub = main_hub_of_worktree()
+    if main_hub is not None:
+        # ハブのワークツリーの中では何も書かない。そこで開いた会話は、元のハブで動くときに取り込まれる
+        if not a.hook:
+            print(f"ハブのワークツリーの中なので、何もしない。元のハブのスクリプトを動かす：\n"
+                  f"  python -X utf8 \"{main_hub / '.claude/skills/harness-session-archive/scripts/session_archive.py'}\" "
+                  + " ".join(x for x in sys.argv[1:] if x != "--hook"))
         return
     dirs, excludes = load_sources()
     roots = [norm(d) for d in dirs]
     for d in (OUT, RAW, DIGEST):
         d.mkdir(parents=True, exist_ok=True)
+    if not acquire_lock():
+        if not a.hook:
+            print(f"ほかの実行が終わらないので、何もしない（{LOCK} が残っていれば、動いている実行が無いことを確かめて消す）")
+        return
     cache = load_cache()
     raw_dir = RAW.resolve()
 
@@ -450,12 +560,12 @@ def main():
         sessions.append({"id": sid, "path": f, "parsed": p, **entry})
         # 生の記録をハブに写す（一覧だけのときと、すでにハブの写しから読んだときは写さない）
         if not a.list and f.resolve().parent != raw_dir:
-            shutil.copy2(f, RAW / f.name)
+            copy_file(f, RAW / f.name)
 
     # 各発言の持ち主：発言に記された会話がその発言を持っていればその会話、無ければ最も早い会話
     def first_ts(s):
         return min((x for x in s["ts"] if x), default="")
-    sessions.sort(key=first_ts)
+    sessions.sort(key=lambda s: (first_ts(s), s["id"]))  # 時刻が同じなら会話の ID の順（読み元によって入れ替わらないように）
     holders = {}
     for s in sessions:
         for u, lab in zip(s["uuids"], s["labels"]):
@@ -531,6 +641,10 @@ def main():
             new = f"# 会話の要約：{redact(r['title'])}\n\n{block}\n{summary_body()}"
         if not out.exists() or out.read_text(encoding="utf-8") != new:
             write_text(out, new)
+        if NOT_SUMMARIZED_RX.search(new):
+            r["until"], r["pending"] = "要約しない", False
+            cache[s["id"]].pop("changed", None)
+            continue
         until = summarized_until(new)
         r["until"] = until
         # 要約が要るのは、要約した範囲の後に研究者の発言があるとき（Claude の最後の返答だけでは要らない）
