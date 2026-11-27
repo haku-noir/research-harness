@@ -20,7 +20,7 @@
 | id | 種類 | 目的（論旨・実験のどこのためか） | 状態 |
 |---|---|---|---|
 
-詳しくは `hub/workstreams.md`。
+詳しくは `hub/workstreams.md`。この表は、`hub/workstreams.md` と作業の行と状態をそろえる（統括が、作業を切り出したとき・状態が変わったとき・終わったときに直す。`harness-dispatch`、`harness-merge`）。
 
 ## 主な未決事項
 
