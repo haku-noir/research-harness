@@ -14,10 +14,18 @@
 """
 from __future__ import annotations
 
+import sys
+
+# 古い Python では、この先の書き方を読めずに分かりにくい失敗をするので、先に知らせて終わる
+if sys.version_info < (3, 10):
+    if "--hook" in sys.argv:
+        sys.exit(0)
+    sys.exit("claude_history: Python 3.10 以降が要る（いまは %d.%d）" % sys.version_info[:2])
+
 import argparse
 import json
+import os
 import re
-import sys
 from collections import Counter
 from datetime import datetime
 from pathlib import Path
@@ -35,13 +43,20 @@ def encode(path: str) -> str:
 
 
 def norm(p: str) -> str:
-    return str(Path(p).resolve()).lower().rstrip("\\/")
+    """作業ディレクトリを比べる形。大文字と小文字は、Windows でだけ同じとみなす（os.path.normcase）。"""
+    return os.path.normcase(str(Path(p).resolve())).rstrip("\\/")
+
+
+def fold_name(s: str) -> str:
+    """履歴のフォルダの名前を比べる形。Windows ではフォルダの名前の大文字・小文字がそろわないことがあるので、Windows でだけ小文字に。"""
+    return s.lower() if os.name == "nt" else s
 
 
 def local_time(ts: str) -> datetime | None:
+    """1970 年より前の時刻は、Windows では astimezone が OSError になるので、読めない時刻として扱う。"""
     try:
         return datetime.fromisoformat(ts.replace("Z", "+00:00")).astimezone()
-    except (ValueError, AttributeError, TypeError):
+    except (ValueError, AttributeError, TypeError, OSError, OverflowError):
         return None
 
 
@@ -186,21 +201,26 @@ def main():
     if not a.project:
         sys.exit("--list か --project を指定する")
 
-    enc = encode(a.project).lower()  # Windows ではフォルダの名前の大文字・小文字がそろわないことがある
+    enc = fold_name(encode(a.project))  # Windows ではフォルダの名前の大文字・小文字がそろわないことがある
     dirs = [p for p in a.base.iterdir() if p.is_dir()
-            and (p.name.lower() == enc or (a.subdirs and p.name.lower().startswith(enc + "-")))]
+            and (fold_name(p.name) == enc or (a.subdirs and fold_name(p.name).startswith(enc + "-")))]
     if not dirs:
         sys.exit(f"該当する履歴が無い: {encode(a.project)}（--list で名前を確かめる）")
-    files = [f for d in dirs for f in d.glob("*.jsonl")]
-    if a.subdirs:
-        # フォルダの名前では「\」と「-」を見分けられない（…\hub と …\hub-old）。会話を開いた場所で確かめる
-        root = norm(a.project)
-        def under(c):
-            if not c:
-                return False
-            n = norm(c)
-            return n == root or n.startswith(root + "\\") or n.startswith(root + "/")
-        files = [f for f in files if under(first_cwd(f))]
+    # フォルダの名前では、記号の違いを見分けられない（…\my-experiment と …\my_experiment、…\hub と …\hub-old は同じ名前になる）。
+    # 会話に記録された作業ディレクトリがあれば、それで確かめる（--subdirs なら、その下のフォルダも含める）。
+    # 記録の無い会話は、名前がそのまま同じフォルダのものだけを残す
+    root = norm(a.project)
+
+    def keep(f):
+        try:
+            c = first_cwd(f)
+        except OSError:
+            c = None
+        if not c:
+            return fold_name(f.parent.name) == enc
+        n = norm(c)
+        return n == root or (a.subdirs and (n.startswith(root + "\\") or n.startswith(root + "/")))
+    files = [f for d in dirs for f in d.glob("*.jsonl") if keep(f)]
     rows = scan(files)
     if a.since:
         rows = [r for r in rows if r[0].strftime("%Y-%m-%d") >= a.since]

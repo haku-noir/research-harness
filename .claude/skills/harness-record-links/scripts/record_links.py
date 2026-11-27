@@ -25,8 +25,11 @@
 - Markdown のリンク（[…](先) と [ ](<先>)）の先を、その記録のフォルダから（無ければハブから）たどり、無ければ出す
 - 印（#d-20260115-143000 の形）が、先の記録に <a id="…"></a> として無ければ出す。見出しへの印は確かめない
 - git の外のもの（records/sessions/raw/、export/）、URL、「*」「{{」を含むものは確かめない
-- 会話の要約の冒頭の囲み（harness-session-archive が書く。コミットの件名や分岐元の題）の中は、先が無くても出さない
-  （だれも直せない所のため）。囲みの中のリンクも、リンクとしては数える
+- 会話の要約の冒頭の囲み（harness-session-archive が書く。コミットの件名や分岐元の題）と、題の行（「# 会話の要約：」。
+  40 字で切った題は、パスの途中で終わることがある）の中は、先のファイルや印が無くても出さない（だれも直せない所のため）。
+  そこにあるリンクも、先があればリンクとして数える
+- リンクの先は、最初の「#」で印と分けてから、それぞれの %xx を戻す（名前の「#」は %23 と書く）。
+  このスクリプトが書くリンクでは、名前の「%」と「#」を %25、%23 にする
 - ひな形の書きかけ（1 行の {{…}}）の中は、記録の名前もリンクも探さない
 
 書けなかったファイル（読み取り専用、パスが長すぎるなど）は飛ばしてほかを続け、手で動かしたときと records/links.md に出す。
@@ -37,12 +40,20 @@
   python -X utf8 record_links.py --hook   （フックから。失敗しても 0 で終わる）
   python -X utf8 record_links.py --check  （書き込まず、切れたリンクの数だけを出す）
 """
+import sys
+
+# 古い Python では、この先の書き方を読めずに分かりにくい失敗をするので、先に知らせて終わる（フックでは何も言わずに終わる）
+if sys.version_info < (3, 10):
+    if "--hook" in sys.argv:
+        sys.exit(0)
+    sys.exit("record_links: Python 3.10 以降が要る（いまは %d.%d）" % sys.version_info[:2])
+
 import atexit
 import os
 import re
 import secrets
+import stat
 import subprocess
-import sys
 import time
 from pathlib import Path
 from urllib.parse import unquote
@@ -71,16 +82,28 @@ NO_MEETING_RX = re.compile(r"^- 相談の記録：\s*なし", re.M)
 KIND_ORDER = ["相談", "実験", "会話", "決定", "論旨", "文字起こし", "経緯", "指示書・報告", "記録"]
 # git のマージがぶつかったときに入る印の行
 CONFLICT_RX = re.compile(r"^(?:<<<<<<< |>>>>>>> |\|\|\|\|\|\|\| ).*$|^=======[ \t]*$")
-# ひな形の書きかけ（1 行の {{…}}）
-PLACEHOLDER_RX = re.compile(r"\{\{[^\n]*?\}\}")
+# ひな形の書きかけ（1 行の {{…}}）。中に「{」「}」を含めない（閉じていない「{{」が長い行に並んでも、行の終わりまで読み直さないため）
+PLACEHOLDER_RX = re.compile(r"\{\{[^{}\n]*\}\}")
+# このスクリプトと会話の記録のスクリプトが作る一時ファイルの名前（make_temp）
+TEMP_RX = re.compile(r"^\.t(?:[0-9a-f]{2}|[0-9a-f]{8})\.tmp$")
+TEMP_STALE_SEC = 600  # これより古い一時ファイルは、止められた実行が残したもの
 # 会話の要約の冒頭の囲み（harness-session-archive が書く）の印
 AUTO_START_RX = re.compile(r"^<!-- auto:start[^>\n]*-->[ \t]*$")
 AUTO_END_RX = re.compile(r"^<!-- auto:end -->[ \t]*$")
 unwritable = []  # 書けなかったファイル（相対パス, 理由）
 
 
+def rel_to(p: Path, base: Path) -> str:
+    """p.relative_to(base).as_posix() と同じ（base の外なら ValueError）。p の字が base の字で始まるときは、字の上で切る
+    （記録が多いと relative_to が遅いため）。"""
+    s, b = str(p), str(base)
+    if s.startswith(b) and s[len(b):len(b) + 1] in ("\\", "/") and ".." not in s[len(b):].replace("\\", "/").split("/"):
+        return s[len(b) + 1:].replace("\\", "/") if os.name == "nt" else s[len(b) + 1:]
+    return p.relative_to(base).as_posix()
+
+
 def rel(p: Path) -> str:
-    return p.relative_to(HUB).as_posix()
+    return rel_to(p, HUB)
 
 
 def mask_code(text: str) -> str:
@@ -111,7 +134,17 @@ def conflict_ok(marks) -> bool:
     return st == 0
 
 
+_analyzed = {}  # 本文 -> analyze の結果（一回の実行の中で、同じ本文を何度も調べないため）
+
+
 def analyze(text: str):
+    r = _analyzed.get(text)
+    if r is None:
+        r = _analyzed[text] = _analyze(text)
+    return r
+
+
+def _analyze(text: str):
     """自動の囲みを、行ごとに見て探す。戻り値：(囲みの行の組 [(始まりの行, 終わりの行)], 崩れているか, 読み飛ばす行, 行)。
     印と見出しとみなすのは、コード（``` の囲みと `…`）の外で、その行がそれだけのものだけ。文の中で触れた印は印ではない。
     始まりの印の行ごとに、その後の最初の終わりの印の行まで（無ければ、次の始まりの印の行か終わりまで）を見る。
@@ -288,6 +321,47 @@ def read(p: Path):
         return None
 
 
+_texts = {}  # パス -> read の結果（リンクを集める間、同じファイルを何度も読まないため）
+
+
+def read_once(p: Path):
+    """read と同じ。一回の実行の中で、同じファイルは一度だけ読む（書き込む前には read で読み直す）。"""
+    k = str(p)
+    if k not in _texts:
+        _texts[k] = read(p)
+    return _texts[k]
+
+
+_resolved = {}  # たたんだパスの字 -> たどった先（一回の実行の中で覚えておく）
+_exists = {}  # たどった先の字 -> あるか
+
+
+def resolve_key(s: str) -> str:
+    """覚えておくときの鍵。Windows では、たどる前に「..」を字の上でたたむ（os.path.realpath と同じ）ので、たたんだ形にする
+    （別の記録から同じ先を指すリンクをまとめる）。ほかの OS では、シンボリックリンクの後ろの「..」の意味が変わるので、そのまま。"""
+    return os.path.normpath(s) if os.name == "nt" else s
+
+
+def resolved(p) -> Path:
+    """Path(p).resolve() と同じ先（シンボリックリンクやジャンクションをたどる）。同じパスは一度だけたどる。
+    たどれなければ OSError か ValueError（呼ぶ側で、そのリンクを飛ばす）。"""
+    k = resolve_key(str(p))
+    r = _resolved.get(k)
+    if r is None:
+        r = Path(os.path.realpath(k))
+        _resolved[k] = r
+        _resolved.setdefault(resolve_key(str(r)), r)  # たどった先をもう一度たどっても同じ
+    return r
+
+
+def exists(p: Path) -> bool:
+    k = str(p)
+    e = _exists.get(k)
+    if e is None:
+        e = _exists[k] = os.path.exists(k)
+    return e
+
+
 def ascii_word(c: str) -> bool:
     return c.isascii() and (c.isalnum() or c == "_")
 
@@ -321,7 +395,7 @@ def find_keys(text, keys):
 
 
 def anchors_of(p: Path):
-    return set(re.findall(r'<a id="([\w-]+)"></a>', read(p) or ""))
+    return set(re.findall(r'<a id="([\w-]+)"></a>', read_once(p) or ""))
 
 
 def skip_target(t: str) -> bool:
@@ -333,11 +407,13 @@ def skip_target(t: str) -> bool:
 def ignored_by_git(paths):
     """git に入れない場所（.gitignore。研究で足したものも含む）にあるパスの集まり。別の PC や取り直したハブでは無いので、切れたと数えない。"""
     rels = []
+    hub_r = resolved(HUB)
     for p in paths:
         try:
-            rels.append(p.resolve().relative_to(HUB.resolve()).as_posix())
-        except ValueError:
+            rels.append(rel_to(resolved(p), hub_r))
+        except (OSError, ValueError):
             pass
+    rels = list(dict.fromkeys(rels))  # 同じ先を指すリンクが多くても、一度だけ聞く
     if not rels:
         return set()
     # フォルダだけに当たる形（data/ など）は、無いパスには「/」を付けないと当たらない。両方で聞き、どちらかで当たれば外とする
@@ -400,18 +476,58 @@ def make_temp(d: Path):
     raise FileExistsError("一時ファイルを作れない（同じ名前の一時ファイルが多すぎる）")
 
 
+def write_target(p: Path) -> Path:
+    """一時ファイルから入れ替える先。シンボリックリンクなら、リンクを残して先のファイルを書く（リンクをふつうのファイルに
+    置き換えないため）。書き込めないファイル（読み取り専用など）は、どの OS でも PermissionError（入れ替えれば書けてしまう
+    OS でも、書かないと決めたものを書き換えないため。Windows では、入れ替えのやり直しで待たないため）。"""
+    if os.path.islink(p):
+        p = Path(os.path.realpath(p))
+    if p.exists() and not os.access(p, os.W_OK):
+        raise PermissionError("読み取り専用")
+    return p
+
+
+def keep_mode(tmp, p: Path):
+    """入れ替える前に、いまのファイルの許可の設定（実行の可否など）を一時ファイルに写す。できなければそのまま。"""
+    try:
+        os.chmod(tmp, stat.S_IMODE(os.stat(p).st_mode))
+    except OSError:
+        pass
+
+
+def clean_temps(dirs):
+    """止められた実行が残した一時ファイル（make_temp の名前で、TEMP_STALE_SEC より古いもの）を消す。ほかのファイルは触らない。
+    ロックを取った後に呼ぶ（そのときに一時ファイルを書いている実行は無い）。時刻は、書き換えと作成（Windows）・属性の変更
+    （ほかの OS）の新しい方で見る（写した一時ファイルは、元のファイルの時刻を受け継ぐため）。消せなくても続ける。"""
+    now = time.time()
+    for d in dirs:
+        try:
+            entries = list(os.scandir(d))
+        except OSError:
+            continue
+        for e in entries:
+            if not TEMP_RX.match(e.name):
+                continue
+            try:
+                st = e.stat(follow_symlinks=False)
+                if stat.S_ISREG(st.st_mode) and now - max(st.st_mtime, st.st_ctime) > TEMP_STALE_SEC:
+                    os.unlink(e.path)
+            except OSError:
+                pass
+
+
 def write_file(p: Path, text: str):
     """LF で、一時ファイルに書いてから入れ替える。中身が変わらなければ書かない（core.autocrlf=true で、
     中身の同じファイルが変更として出ないように）。書けなければ OSError（呼ぶ側で、ほかのファイルを続ける）。"""
+    p = write_target(p)
     if same_text(p, text):
         return
-    if os.name == "nt" and p.exists() and not os.access(p, os.W_OK):
-        raise PermissionError("読み取り専用")  # 入れ替えのやり直しで待たないように、先に確かめる
     p.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp = make_temp(p.parent)
     try:
         with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as fh:
             fh.write(text)
+        keep_mode(tmp, p)
         replace(tmp, p)
     except BaseException:
         try:
@@ -531,8 +647,32 @@ def keep_lock():
         _last_touch[0] = now
 
 
+_relpaths = {}  # (元のフォルダ, 先) -> 相対パス（一回の実行の中で覚えておく）
+
+
+def relpath(dst: Path, src_dir: Path) -> str:
+    """os.path.relpath(dst, src_dir) を「/」で区切ったもの。どちらもハブの中なら、ハブからの相対の字の上で求める
+    （記録が多いと os.path.relpath が遅いため）。名前は、os.path.relpath と同じく os.path.normcase で比べる。"""
+    try:
+        a = [x for x in rel_to(src_dir, HUB).split("/") if x not in ("", ".")]
+        b = [x for x in rel_to(dst, HUB).split("/") if x not in ("", ".")]
+    except ValueError:
+        a = b = [".."]
+    if ".." in a or ".." in b:
+        return os.path.relpath(dst, src_dir).replace("\\", "/")
+    i = 0
+    while i < len(a) and i < len(b) and os.path.normcase(a[i]) == os.path.normcase(b[i]):
+        i += 1
+    return "/".join([".."] * (len(a) - i) + b[i:]) or "."
+
+
 def link_to(src_dir: Path, dst: Path, anchor=None) -> str:
-    r = os.path.relpath(dst, src_dir).replace("\\", "/")
+    """src_dir から dst へのリンクの先。名前の「%」と「#」は %25、%23 にする（「#」は印の区切り、「%」は %xx と読まれるため）。"""
+    k = (str(src_dir), str(dst))
+    r = _relpaths.get(k)
+    if r is None:
+        r = relpath(dst, src_dir).replace("%", "%25").replace("#", "%23")
+        _relpaths[k] = r
     if anchor:
         r += f"#{anchor}"
     return f"<{r}>" if (" " in r or "(" in r or ")" in r) else r
@@ -558,6 +698,10 @@ def main():
             print(f"ほかの実行が終わらないので、何もしない（{LOCK} が残っていれば、動いている実行が無いことを確かめて消す）")
         return
     nodes = collect_nodes()
+    if not check:
+        # 止められた実行が残した一時ファイルを消す（書き込むかもしれない記録のフォルダ、records/、chats/）
+        clean_temps(dict.fromkeys([str(v["path"].parent) for v in nodes.values() if v["inject"]]
+                                  + [str(HUB / "records"), str(HUB / "chats")]))
     keys = sorted(((k, n, bool(re.fullmatch(r"[0-9a-f]{8}", k))) for n, v in nodes.items() for k in v["keys"]),
                   key=lambda x: -len(x[0]))
     by_path = {v["path"].resolve(): n for n, v in nodes.items()}
@@ -580,46 +724,62 @@ def main():
         if not check:  # --check ではロックを取らない
             keep_lock()
         sp = nodes[src]["path"]
-        raw_text = read(sp)
+        raw_text = read_once(sp)
         if raw_text is None:
             continue  # 開けなかった（読めなかったファイルとして知らせる）
         if nodes[src]["inject"] and find_block(raw_text) == "broken":
             broken_blocks.append(src)
         # ひな形の書きかけ（{{…}}）の中は、名前もリンクも探さない
         text = mask_placeholders(strip_generated(raw_text))
-        for dst, anchors in find_keys(text, keys).items():
-            if dst == src:
-                continue
-            out_edges[src].setdefault(dst, set()).update(anchors)
-            for a in sorted(anchors):
-                check_anchor(src, dst, a)
+        sp_dir = str(sp.parent)
+
+        def names(t_all, report):
+            """記録の名前が書かれた所を拾う。report が偽なら、印が無くても出さない（リンクとしては数える）。"""
+            for dst, anchors in find_keys(t_all, keys).items():
+                if dst == src:
+                    continue
+                out_edges[src].setdefault(dst, set()).update(anchors)
+                if report:
+                    for a in sorted(anchors):
+                        check_anchor(src, dst, a)
 
         def scan(t_all, report):
             """Markdown のリンクの先を、その記録のフォルダから（無ければハブから）たどって確かめる。
-            コードの中に書いた例（``` の囲みと `…`）は確かめない。report が偽なら、先が無くても出さない（リンクとしては数える）。"""
+            コードの中に書いた例（``` の囲みと `…`）は確かめない。report が偽なら、先のファイルや印が無くても出さない
+            （先があれば、リンクとしては数える）。"""
             code_free = INLINE_CODE_RX.sub(" ", FENCE_RX.sub(" ", t_all))
             for m in LINK_RX.finditer(code_free):
                 t = m.group(1).strip("<>").strip()
                 if skip_target(t):
                     continue
-                path_part, _, anchor = unquote(t).partition("#")
+                # 最初の「#」で印と分けてから %xx を戻す（名前の「#」は %23 と書かれる）
+                path_part, _, anchor = t.partition("#")
+                path_part, anchor = unquote(path_part), unquote(anchor)
                 if not path_part:
                     continue
+                # その記録のフォルダからたどる。無いときだけ、ハブからもたどる
                 try:
-                    cands = [(sp.parent / path_part).resolve(), (HUB / path_part).resolve()]
+                    c1 = resolved(os.path.join(sp_dir, path_part))
+                    hit = c1 if exists(c1) else None
+                    if hit is None:
+                        c2 = resolved(os.path.join(str(HUB), path_part))
+                        hit = c2 if exists(c2) else None
                 except (OSError, ValueError):
                     continue
-                hit = next((c for c in cands if c.exists()), None)
                 if hit is None:
                     if report:
-                        missing.append((src, t, cands))
+                        missing.append((src, t, [c1, c2]))
                     continue
-                dst = by_path.get(hit) or by_path.get((hit / "README.md").resolve())
+                try:
+                    dst = by_path.get(hit) or by_path.get(resolved(hit / "README.md"))
+                except (OSError, ValueError):
+                    continue
                 if dst and dst != src:
                     out_edges[src].setdefault(dst, set())
                     if anchor:
                         out_edges[src][dst].add(anchor)
-                        check_anchor(src, dst, anchor)
+                        if report:
+                            check_anchor(src, dst, anchor)
             if not report:
                 return
             # リンクにせずに書いた記録のパスで、実在しないもの（``` の囲みの中の例は除く）
@@ -635,22 +795,35 @@ def main():
                 if not bare_path_exists(path):
                     missing.append((src, path, [HUB / path]))
 
-        # 会話の要約の冒頭の囲み（コミットの件名、分岐元の題）は、だれも直せないので、先が無くても出さない
+        # 会話の要約の冒頭の囲み（コミットの件名、分岐元の題）と題の行（40 字で切った題は、パスの途中で終わることがある）は、
+        # だれも直せないので、先のファイルや印が無くても出さない
         lines_t = text.split("\n")
-        region = auto_region(lines_t) if nodes[src]["kind"] == "会話" else None
-        if region:
-            a0, a1 = region
-            scan("\n".join(lines_t[:a0] + [""] * (a1 - a0 + 1) + lines_t[a1 + 1:]), True)
-            scan("\n".join(lines_t[a0:a1 + 1]), False)
+        quiet = set()
+        if nodes[src]["kind"] == "会話":
+            region = auto_region(lines_t)
+            if region:
+                quiet.update(range(region[0], region[1] + 1))
+            first = next((i for i, x in enumerate(lines_t) if x.strip()), None)
+            if first is not None and lines_t[first].startswith("# 会話の要約："):
+                quiet.add(first)
+        if quiet:
+            loud_t = "\n".join("" if i in quiet else x for i, x in enumerate(lines_t))
+            quiet_t = "\n".join(x if i in quiet else "" for i, x in enumerate(lines_t))
+            names(loud_t, True)
+            names(quiet_t, False)
+            scan(loud_t, True)
+            scan(quiet_t, False)
         else:
+            names(text, True)
             scan(text, True)
     ign = ignored_by_git([c for _, _, cs in missing for c in cs])
+    hub_r = resolved(HUB)
     for src, t, cs in missing:
         rels = set()
         for c in cs:
             try:
-                rels.add(c.resolve().relative_to(HUB.resolve()).as_posix())
-            except ValueError:
+                rels.add(rel_to(resolved(c), hub_r))
+            except (OSError, ValueError):
                 pass
         if not (rels & ign):
             broken.append((src, t, "ファイルが無い"))
@@ -668,7 +841,7 @@ def main():
             continue
         if any(nodes[s]["kind"] == "相談" for s in in_edges[n]):
             continue
-        if NO_MEETING_RX.search(read(v["path"]) or ""):
+        if NO_MEETING_RX.search(read_once(v["path"]) or ""):
             continue
         unlinked.append(n)
 

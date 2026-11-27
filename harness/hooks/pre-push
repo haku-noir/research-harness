@@ -15,10 +15,11 @@ url="$2"
 
 # URL の書き方の揺れをそろえる（https://github.com/o/r.git、git@github.com:o/r、https://github.com/o/r/、
 # ssh://git@github.com:22/o/r.git、https://github.com:443/o/r、git@github.com:/o/r.git を同じとみなす）：
-# 小文字にし、方式（https:// など）のある形ではポート（:22 など）を外し、方式と「ユーザー@」を外し、
+# 末尾の空白を外し、小文字にし、方式（https:// など）のある形ではポート（:22 など）を外し、方式と「ユーザー@」を外し、
 # 「ホスト:パス」を「ホスト/パス」にし、続いた「/」を一つにし、末尾の「/」と「.git」を外す
 norm_url() {
   printf '%s\n' "$1" | tr 'A-Z' 'a-z' | sed \
+    -e 's/[[:space:]]*$//' \
     -e 's#^\([a-z][a-z0-9+.-]*://[^/]*\):[0-9]*/#\1/#' \
     -e 's#^\([a-z][a-z0-9+.-]*://[^/]*\):[0-9]*$#\1#' \
     -e 's#^[a-z][a-z0-9+.-]*://##' \
@@ -32,19 +33,36 @@ norm_url() {
 
 template_url=$(git config --get remote.template.url 2>/dev/null)
 
+nl='
+'
+
 if [ -n "$template_url" ]; then
-  template_norm=$(norm_url "$template_url")
-  # 送り先の URL と、リモート名に設定した URL（url と pushurl）のどれかが、ひな形の URL と同じなら止める
+  # ひな形の URL。設定した値と、git が書き換え（url.<base>.insteadOf など）を当てた後の値
+  template_urls=$(printf '%s\n' "$template_url"
+    git remote get-url --all template 2>/dev/null
+    git remote get-url --push --all template 2>/dev/null)
+  template_norms="$nl"
+  while IFS= read -r t; do
+    [ -z "$t" ] && continue
+    template_norms="$template_norms$(norm_url "$t")$nl"
+  done <<EOF
+$template_urls
+EOF
+  # 送り先の URL と、リモート名に設定した URL（url と pushurl。書き換えを当てた後の値も）のどれかが、ひな形の URL と同じなら止める
   candidates=$(printf '%s\n%s\n' "$url" "$remote"
     git config --get-all "remote.$remote.url" 2>/dev/null
-    git config --get-all "remote.$remote.pushurl" 2>/dev/null)
+    git config --get-all "remote.$remote.pushurl" 2>/dev/null
+    git remote get-url --all "$remote" 2>/dev/null
+    git remote get-url --push --all "$remote" 2>/dev/null)
   to_template=""
   [ "$remote" = "template" ] && to_template="yes"
   while IFS= read -r c; do
     [ -z "$c" ] && continue
-    if [ "$(norm_url "$c")" = "$template_norm" ]; then
-      to_template="yes"
-    fi
+    n=$(norm_url "$c")
+    [ -z "$n" ] && continue
+    case "$template_norms" in
+      *"$nl$n$nl"*) to_template="yes" ;;
+    esac
   done <<EOF
 $candidates
 EOF
@@ -55,12 +73,18 @@ EOF
   fi
 fi
 
+# 許可は 1 行に 1 つ。行の全体がリモート名と同じものだけを許可とみなす（値を空白で分けたり、「*」をファイルの名前に
+# 広げたりしない）
+allowed_list=$(git config --get-all hub.pushAllowed 2>/dev/null)
 allowed_remote=""
-for allowed in $(git config --get-all hub.pushAllowed 2>/dev/null); do
+while IFS= read -r allowed; do
+  [ -z "$allowed" ] && continue
   if [ "$remote" = "$allowed" ]; then
     allowed_remote="yes"
   fi
-done
+done <<EOF
+$allowed_list
+EOF
 
 if [ -z "$allowed_remote" ]; then
   echo "止めました：研究ハブの push 先として許可していないリモートです（$remote：$url）。" >&2

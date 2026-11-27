@@ -9,7 +9,8 @@
   - あれば、冒頭の <!-- auto:start --> 〜 <!-- auto:end --> の間（会話の ID、期間、生の記録への参照、ハブのコミット）だけを書き直す。
     書き直すのは、囲みが最初の「## 」の見出しより前にあり、中身がこのスクリプトの書く形の行だけのときだけ
     （組になった git のぶつかりの印の行は、スクリプトの行とみなす）。崩れていれば触らずに知らせる。
-    囲みが無ければ（消された）、最初の「# 」の行の後ろ（無ければいちばん上）に新しく入れる。
+    囲みの印の行が一つも無ければ（消された）、最初の「# 」の行の後ろ（無ければいちばん上）に新しく入れる。
+    印の行（始まりか終わり）が残っていて、正しい囲みになっていなければ、崩れているとして触らずに知らせる。
   - 先頭 8 文字が同じ別の会話の要約（囲みの「会話の ID」が別の会話）は使わない。その会話の要約は作らずに知らせる。
   - 要約の本文は Claude が書く（.claude/skills/harness-session-archive/SKILL.md）。このスクリプトは書かない。
 - 一覧 records/sessions/README.md を作り直す。要約が要る会話（未要約、または要約した範囲の後に発言が増えた会話）を示す。
@@ -24,16 +25,25 @@
   python -X utf8 session_archive.py --hook     （Claude Code のフックから。標準入力の transcript_path も探す場所に足す。失敗しても 0 で終わる）
   python -X utf8 session_archive.py --list     （対象の会話を一覧するだけ）
 """
+import sys
+
+# 古い Python では、この先の書き方を読めずに分かりにくい失敗をするので、先に知らせて終わる（フックでは何も言わずに終わる）
+if sys.version_info < (3, 10):
+    if "--hook" in sys.argv:
+        sys.exit(0)
+    sys.exit("session_archive: Python 3.10 以降が要る（いまは %d.%d）" % sys.version_info[:2])
+
 import argparse
 import atexit
+import bisect
 import hashlib
 import json
 import os
 import re
 import secrets
 import shutil
+import stat
 import subprocess
-import sys
 import time
 from datetime import datetime
 from pathlib import Path
@@ -48,7 +58,10 @@ LOCK = (HUB / ".git" / "hub-scripts.lock") if (HUB / ".git").is_dir() else (HUB 
 # これより古いロックは、止められた実行が残したものとして外す。会話の終わりのフックは 60 秒ほどで止められ、
 # 手で動かした長い実行は 20 秒ごとにロックの時刻を新しくする（keep_lock）ので、これより古いものは確かに止まっている
 STALE_SEC = 90
-CACHE_VERSION = 4  # 読み方を変えたら上げる。上がると、すべての会話を一度読み直す
+CACHE_VERSION = 5  # 読み方を変えたら上げる。上がると、すべての会話を一度読み直す
+CACHE_SAVE_EVERY, CACHE_SAVE_SEC = 25, 10  # 読み直した会話がこの数になるか、この秒数がたつごとに、途中までを控えに書く
+TEMP_RX = re.compile(r"^\.t(?:[0-9a-f]{2}|[0-9a-f]{8})\.tmp$")  # make_temp の名前
+TEMP_STALE_SEC = 600  # これより古い一時ファイルは、止められた実行が残したもの
 SOURCES = HUB / "hub" / "session-sources.txt"
 PROJECTS = Path.home() / ".claude" / "projects"
 TRAILER = "Hub-Session"
@@ -59,14 +72,59 @@ SKIP_PREFIXES = (
     "[Request interrupted", "<ci-monitor-event", "<user-prompt-submit-hook",
 )
 CHORE_RX = re.compile(r"^chore\((sessions|links)\)!?:")
+SECRET_MARK = "<秘密の値>"
+# 鍵の前後は英数字で区切る（\b は日本語も字に数えるので、「キーはghp_…」の鍵を見落とす）。中身も英数字と記号だけにする
+# （日本語や、ふつうの英語の文を飲み込まないように）
+_NB = r"(?<![A-Za-z0-9])"
+# PEM の秘密鍵（redact_pem）
+PEM_BEGIN_RX = re.compile(r"-----BEGIN (?:[A-Z0-9]+ ){0,4}PRIVATE KEY-----")
+PEM_END_RX = re.compile(r"-----END (?:[A-Z0-9]+ ){0,4}PRIVATE KEY-----")
+PEM_BODY_RX = re.compile(r"(?:[ \t]*\r?\n?[ \t]*[A-Za-z0-9+/=]{16,})*")
+PEM_MAX = 16384  # 始まりの行から、終わりの行までの長さの上限
 SECRET = [
     # 英数字だけで、前半は 64 字まで（日本語は \w に入るので、長い日本語の並びを読みに行かないように）
     (re.compile(r"(?<![A-Za-z0-9._%+-])[A-Za-z0-9._%+-]{1,64}@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+"), "<メールアドレス>"),
-    (re.compile(r"\b(sk-ant-[\w-]{10,}|sk-[\w-]{20,}|ghp_\w{20,}|github_pat_\w{20,}|xox[abpr]-[\w-]{10,})"), "<秘密の値>"),
+    # JSON Web Token（eyJ で始まる、base64url の 3 つの部分）
+    (re.compile(_NB + r"eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}"), SECRET_MARK),
+    # 「sk-」と Slack は、数字を含むものだけ（「xoxo-hugs-and-kisses」のような、ふつうの言葉の並びを伏せないように）
+    (re.compile(_NB + r"(?:sk-ant-[A-Za-z0-9_-]{10,}"  # Anthropic
+                r"|sk-(?=[A-Za-z0-9_-]{0,255}[0-9])[A-Za-z0-9_-]{20,}"  # OpenAI など
+                r"|gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}"  # GitHub
+                r"|(?:xox[abcdeprs]|xapp)-(?=[A-Za-z0-9-]{0,255}[0-9])[A-Za-z0-9-]{10,}"  # Slack
+                r"|(?:AKIA|ASIA)[A-Z0-9]{16}(?![A-Za-z0-9])"  # AWS のアクセスキー ID
+                r"|AIza[A-Za-z0-9_-]{35,}"  # Google の API キー
+                r"|hf_[A-Za-z0-9]{30,}"  # Hugging Face
+                r"|glpat-[A-Za-z0-9_-]{20,}"  # GitLab
+                r"|[sr]k_live_[A-Za-z0-9]{16,})"), SECRET_MARK),  # Stripe
+    # 「Bearer <トークン>」。数字を含む 20 字以上だけ（ふつうの英語の「bearer of …」を伏せないように）
+    (re.compile(_NB + r"([Bb]earer[ \t]+)(?=[A-Za-z0-9._~+/=-]{0,512}[0-9])[A-Za-z0-9._~+/=-]{20,}"), r"\1" + SECRET_MARK),
 ]
 
 
+def redact_pem(t: str) -> str:
+    """PEM の秘密鍵を、始まりの行から終わりの行まで（PEM_MAX まで）伏せる。終わりの行が無ければ（途中で切れた）、
+    始まりの行と、後ろに続く鍵の字の行を伏せる。終わりの行の位置は先に一度だけ探す（始まりの行が多くても遅くならないように）。"""
+    if "PRIVATE KEY-----" not in t:
+        return t
+    ends = [(m.start(), m.end()) for m in PEM_END_RX.finditer(t)]
+    end_starts = [s for s, _ in ends]
+    out, pos = [], 0
+    for m in PEM_BEGIN_RX.finditer(t):
+        if m.start() < pos:
+            continue  # 伏せた範囲の中
+        i = bisect.bisect_left(end_starts, m.end())
+        if i < len(ends) and ends[i][0] - m.end() <= PEM_MAX:
+            end = ends[i][1]
+        else:
+            end = PEM_BODY_RX.match(t, m.end()).end()
+        out += [t[pos:m.start()], SECRET_MARK]
+        pos = end
+    out.append(t[pos:])
+    return "".join(out)
+
+
 def redact(t: str) -> str:
+    t = redact_pem(t)
     for rx, rep in SECRET:
         t = rx.sub(rep, t)
     return t
@@ -77,20 +135,29 @@ def encode(path: str) -> str:
 
 
 def norm(p: str) -> str:
-    return str(Path(p).resolve()).lower().rstrip("\\/")
+    """作業ディレクトリを比べる形。大文字と小文字は、Windows でだけ同じとみなす（os.path.normcase）。
+    大文字と小文字を分けるファイルシステムでは、名前の大文字・小文字だけが違う二つのフォルダは別のもの。"""
+    return os.path.normcase(str(Path(p).resolve())).rstrip("\\/")
+
+
+def fold_name(s: str) -> str:
+    """Claude Code の会話のフォルダの名前を比べる形。Windows ではフォルダの名前の大文字・小文字がそろわないことがあるので、
+    Windows でだけ小文字にそろえる。"""
+    return s.lower() if os.name == "nt" else s
 
 
 def load_sources():
     dirs, excludes = [], []
     if not SOURCES.exists():
         return [str(HUB)], []
-    # BOM 付きでも読めるように utf-8-sig。行の途中の「 #」より後は注釈として読み飛ばす
+    # BOM 付きでも読めるように utf-8-sig。「#」は、行の最初の（空白でない）字のときだけ注釈とする
+    # （パスの中の「 #」（…\My Research #2\code）で切らないため）
     try:
         src = SOURCES.read_text(encoding="utf-8-sig")
     except UnicodeDecodeError:  # 別の文字コードで保存された（説明の行が化けても、パスの行は読める）
         src = SOURCES.read_text(encoding="utf-8", errors="replace")
     for line in src.splitlines():
-        line = re.split(r"\s#", line, maxsplit=1)[0].strip()
+        line = line.strip()
         if not line or line.startswith("#"):
             continue
         if line.startswith("!"):
@@ -106,10 +173,17 @@ def load_sources():
 
 
 def local(ts):
+    """記録の時刻（ISO 8601）を、この PC の時間帯の時刻にする。読めなければ None。
+    1970 年より前の時刻は、Windows では astimezone が OSError になるので、読めない時刻として扱う（会話の全体を止めない）。"""
     try:
         return datetime.fromisoformat(ts.replace("Z", "+00:00")).astimezone()
-    except (ValueError, AttributeError, TypeError):
+    except (ValueError, AttributeError, TypeError, OSError, OverflowError):
         return None
+
+
+def readable(stamps):
+    """時刻の並びのうち、最初に読めるものを、この PC の時間帯の時刻で。どれも読めなければ None。"""
+    return next((t for t in map(local, stamps) if t is not None), None)
 
 
 def mtime(f: Path) -> float:
@@ -125,17 +199,17 @@ def candidate_files(dirs, extra=()):
     files = {}
     folders = []
     if PROJECTS.exists():
-        encs = [encode(d).lower() for d in dirs]  # Windows ではフォルダの名前の大文字・小文字がそろわないことがある
+        encs = [fold_name(encode(d)) for d in dirs]  # Windows ではフォルダの名前の大文字・小文字がそろわないことがある
         try:
             folders = [p for p in PROJECTS.iterdir()
-                       if any(p.name.lower() == e or p.name.lower().startswith(e + "-") for e in encs) and p.is_dir()]
+                       if any(fold_name(p.name) == e or fold_name(p.name).startswith(e + "-") for e in encs) and p.is_dir()]
         except OSError:
             folders = []
-    seen = {str(p.resolve()).lower() for p in folders}
+    seen = {os.path.normcase(str(p.resolve())) for p in folders}
     for p in extra:
-        if str(p.resolve()).lower() not in seen:
+        if os.path.normcase(str(p.resolve())) not in seen:
             folders.append(p)
-            seen.add(str(p.resolve()).lower())
+            seen.add(os.path.normcase(str(p.resolve())))
     for p in folders:
         try:
             found = list(p.glob("*.jsonl"))
@@ -202,11 +276,12 @@ def tool_summary(b):
     name, inp = b.get("name", "?"), b.get("input", {}) or {}
     if name == "AskUserQuestion":
         return None  # 質問は別に載せる
+    # 伏せてから切る（切ってから伏せると、途中で切れたメールアドレスや鍵が残るため）
     for key in ("description", "file_path", "path", "pattern", "query", "url", "title", "skill"):
         if inp.get(key):
-            return f"{name}（{one_line(inp[key])}）"
+            return f"{name}（{one_line(redact(str(inp[key])))}）"
     if inp.get("command"):
-        return f"{name}（{one_line(inp['command'], 80)}）"
+        return f"{name}（{one_line(redact(str(inp['command'])), 80)}）"
     return name
 
 
@@ -214,7 +289,7 @@ def ask_text(inp):
     out = []
     for q in inp.get("questions", []) or []:
         opts = " / ".join(o.get("label", "") for o in q.get("options", []) or [])
-        out.append(f"- 問い：{one_line(q.get('question', ''), 300)}（選択肢：{opts}）")
+        out.append(f"- 問い：{one_line(redact(str(q.get('question', ''))), 300)}（選択肢：{opts}）")
     return "\n".join(out)
 
 
@@ -284,7 +359,7 @@ def parse(path: Path):
                         if isinstance(x, dict) and x.get("type") == "tool_result" and x.get("tool_use_id") in ask_ids:
                             ans = tool_result_text(x.get("content"))
                             items.append({"uuid": f"{uuid}-a", "label": label, "kind": "answer", "ts": ts,
-                                          "text": ask_ids[x["tool_use_id"]] + "\n- 研究者の回答：" + one_line(ans, 2000)})
+                                          "text": ask_ids[x["tool_use_id"]] + "\n- 研究者の回答：" + one_line(redact(ans), 2000)})
                             cur = None
                 t, kind = user_text(content)
                 if t and not t.startswith("This session is being continued"):
@@ -328,7 +403,8 @@ def parse(path: Path):
         others = said.get((i["label"], re.sub(r"\s+", " ", i["text"]).strip()), [])
         return any(t0 is None or x is None or abs((x - t0).total_seconds()) < 600 for x in others)
     items = [i for i in items if not dup(i)]
-    title = title_c or title_a or next((one_line(i["text"], 40) for i in items if i["kind"] == "user"), sid[:8])
+    # 題は、伏せてから 40 字で切る（切ってから伏せると、途中で切れたメールアドレスや鍵が、要約の題と一覧に残るため）
+    title = redact(title_c or title_a or next((one_line(redact(i["text"]), 40) for i in items if i["kind"] == "user"), sid[:8]))
     times = [local(i.get("te") or i["ts"]) for i in items]
     first = next((local(i["ts"]) for i in items if local(i["ts"])), None)
     last = max((t for t in times if t), default=None)
@@ -383,7 +459,7 @@ def render_digest(s, items, parent_title):
          f"- 作業ディレクトリ：`{s['cwd'] or '不明'}`",
          f"- 生の記録：`records/sessions/raw/{s['id']}.jsonl`（`<!-- uuid: … -->` の値で行を探せる）"]
     if parent_title:
-        L.append(f"- 分岐元：{parent_title}。分岐元と同じ部分は省いた")
+        L.append(f"- 分岐元：{redact(parent_title)}。分岐元と同じ部分は省いた")
     L += ["", "道具の結果は載せていない（選択肢での質問と回答は載せる）。git の外のファイル。", ""]
     day = None
     for it in items:
@@ -444,7 +520,10 @@ def find_auto(text: str):
     - その後、ほかの始まりの印より前に、終わりの印の行がある
     - 間の行（空行を除く）が、どれも auto_block() の書く形。git のぶつかりの印の行（<<<<<<< など）は、
       間で組としてそろっていれば、書く形の行とみなす（マージでぶつかった囲みを書き直せるように）
-    「## 」より後ろにだけ始まりの印の行があるときも、崩れているとする（囲みが動かされた）。"""
+    「## 」より後ろにだけ始まりの印の行があるときも、崩れているとする（囲みが動かされた）。
+    始まりの印の行より前に終わりの印の行があるときと、
+    正しい囲みが無く、コードの外に印の行（始まりか終わり）が一つでもあるときは、崩れているとする（終わりの印だけが残った要約に、
+    二つ目の囲みを入れて、前にスクリプトが書いた行を本文に残さないため）。None は、印の行が一つも無いときだけ。"""
     off, fence, start, conf = 0, False, None, []
     for line in text.split("\n"):
         if start is None:
@@ -453,10 +532,11 @@ def find_auto(text: str):
             elif not fence:
                 if AUTO_START_RX.match(line):
                     start = off
+                elif AUTO_END_RX.match(line):
+                    return "broken"  # 始まりの印より前に終わりの印がある（始まりの印が消えた）
                 elif line.startswith("## "):
                     # 見出しより後ろの始まりの印は、冒頭の囲みとはみなさない
-                    rest = text[off:]
-                    return "broken" if _marker_outside_code(rest) else None
+                    return "broken" if _marker_outside_code(text) else None
         else:
             if AUTO_END_RX.match(line):
                 if conf and not conflict_ok(conf):
@@ -467,7 +547,7 @@ def find_auto(text: str):
             elif line.strip() and not AUTO_LINE_RX.match(line):
                 return "broken"  # 終わりの印が欠けた、またはスクリプトの書かない行がある
         off += len(line) + 1
-    return "broken" if start is not None else None
+    return "broken" if start is not None or _marker_outside_code(text) else None
 
 
 def summary_ids(text: str):
@@ -498,11 +578,12 @@ def insert_auto(text: str, block: str) -> str:
 
 
 def _marker_outside_code(text: str) -> bool:
+    """コード（``` の囲み）の外に、冒頭の囲みの印の行（始まりか終わり）があるか。"""
     fence = False
     for line in text.split("\n"):
         if line.lstrip().startswith(("```", "~~~")):
             fence = not fence
-        elif not fence and AUTO_START_RX.match(line):
+        elif not fence and (AUTO_START_RX.match(line) or AUTO_END_RX.match(line)):
             return True
     return False
 
@@ -510,6 +591,13 @@ def _marker_outside_code(text: str) -> bool:
 def no_marker(t: str) -> str:
     """件名や題に書かれた「<!--」を、囲みの印と取り違えない形にする（表示は同じ）。"""
     return t.replace("<!--", "&lt;!--")
+
+
+def table_cell(t: str) -> str:
+    """一覧の表の欄に入れる形。「|」は「／」に、「<!--」は印と取り違えない形に、末尾の「\\」は「＼」にする
+    （表の区切りを壊したり、印を作ったりしないため）。"""
+    t = no_marker(t.replace("|", "／"))
+    return re.sub(r"\\+$", lambda m: "＼" * len(m.group(0)), t)
 
 
 SUMMARY_BODY = """
@@ -553,7 +641,7 @@ def auto_block(s, r, parent, commits):
     if r["first"] and r["last"]:
         L.append(f"- 期間：{r['first']:%Y-%m-%d %H:%M} 〜 {r['last']:%Y-%m-%d %H:%M}")
     if parent:
-        L.append(f"- 分岐元：[{no_marker(redact(one_line(parent['title'], 200)))}]({parent['file']})")
+        L.append(f"- 分岐元：[{no_marker(one_line(redact(parent['title']), 200))}]({parent['file']})")
     L += [f"- 生の記録：`records/sessions/raw/{s['id']}.jsonl`（git の外。この PC だけ）",
           f"- 読める形：`records/sessions/raw/digest/{s['id']}.md`（git の外）"]
     if commits:
@@ -633,18 +721,58 @@ def same_text(path: Path, text: str) -> bool:
         return False
 
 
+def write_target(path: Path) -> Path:
+    """一時ファイルから入れ替える先。シンボリックリンクなら、リンクを残して先のファイルを書く（リンクをふつうのファイルに
+    置き換えないため）。書き込めないファイル（読み取り専用など）は、どの OS でも PermissionError（入れ替えれば書けてしまう
+    OS でも、書かないと決めたものを書き換えないため。Windows では、入れ替えのやり直しで待たないため）。"""
+    if os.path.islink(path):
+        path = Path(os.path.realpath(path))
+    if path.exists() and not os.access(path, os.W_OK):
+        raise PermissionError("読み取り専用")
+    return path
+
+
+def keep_mode(tmp, path: Path):
+    """入れ替える前に、いまのファイルの許可の設定を一時ファイルに写す。できなければ（まだ無いなど）そのまま。"""
+    try:
+        os.chmod(tmp, stat.S_IMODE(os.stat(path).st_mode))
+    except OSError:
+        pass
+
+
+def clean_temps(dirs):
+    """止められた実行が残した一時ファイル（make_temp の名前で、TEMP_STALE_SEC より古いもの）を消す。ほかのファイルは触らない。
+    ロックを取った後に呼ぶ（そのときに一時ファイルを書いている実行は無い）。時刻は、書き換えと作成（Windows）・属性の変更
+    （ほかの OS）の新しい方で見る（生の記録を写した一時ファイルは、元のファイルの時刻を受け継ぐため）。消せなくても続ける。"""
+    now = time.time()
+    for d in dirs:
+        try:
+            entries = list(os.scandir(d))
+        except OSError:
+            continue
+        for e in entries:
+            if not TEMP_RX.match(e.name):
+                continue
+            try:
+                st = e.stat(follow_symlinks=False)
+                if stat.S_ISREG(st.st_mode) and now - max(st.st_mtime, st.st_ctime) > TEMP_STALE_SEC:
+                    os.unlink(e.path)
+            except OSError:
+                pass
+
+
 def write_text(path: Path, text: str):
     """改行は LF にそろえ、その都度ちがう名前の一時ファイルに書いてから入れ替える。
     途中で止まっても壊れたファイルを残さず、同時に動いた別の会話のフックともぶつからない。
     中身が変わらなければ書かない（core.autocrlf=true で、中身の同じファイルが変更として出ないように）。"""
+    path = write_target(path)
     if same_text(path, text):
         return
-    if os.name == "nt" and path.exists() and not os.access(path, os.W_OK):
-        raise PermissionError("読み取り専用")  # 入れ替えのやり直しで待たないように、先に確かめる
     fd, tmp = make_temp(path.parent)
     try:
         with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as fh:
             fh.write(text)
+        keep_mode(tmp, path)
         replace(tmp, path)
     except BaseException:
         try:
@@ -705,11 +833,14 @@ def keep_lock():
 
 
 def copy_file(src: Path, dst: Path):
-    """生の記録を写す。一時ファイルに写してから入れ替える（会話のファイルが消えた後は、これが唯一の写しになるため）。"""
+    """生の記録を写す。一時ファイルに写してから入れ替える（会話のファイルが消えた後は、これが唯一の写しになるため）。
+    写しがシンボリックリンクなら先のファイルを書き、読み取り専用なら書かない（write_target）。"""
+    dst = write_target(dst)
     fd, tmp = make_temp(dst.parent)
     os.close(fd)
     try:
         shutil.copy2(src, tmp)
+        keep_mode(tmp, dst)
         replace(tmp, dst)
     except BaseException:
         try:
@@ -806,7 +937,7 @@ def other_rows(sessions, excludes, seen8, seen_ids, used, skipped):
             continue
         head = text.split("\n", 1)[0].strip()
         title = head[len("# 会話の要約："):] if head.startswith("# 会話の要約：") else ""
-        title = one_line(title.strip() or p.stem, 200).replace("|", "／")
+        title = table_cell(one_line(redact(title.strip() or p.stem), 200))
         out.append((day, f"| {day} | {title}{note} | `{id8}` | [{p.name}]({p.name}) | {state} |"))
     for (id8, kind), (when, line) in linkless.items():
         if id8 in cur8 or any(id8.startswith(x[:8]) for x in excludes):
@@ -854,8 +985,30 @@ def main():
         if not a.hook:
             print(f"ほかの実行が終わらないので、何もしない（{LOCK} が残っていれば、動いている実行が無いことを確かめて消す）")
         return
+    clean_temps((OUT, RAW, DIGEST))  # 止められた実行が残した一時ファイル
     cache = load_cache()
     raw_dir = RAW.resolve()
+    saving = {"n": 0, "t": time.time(), "err": None}  # 前に控えを書いてから読み直した数と時刻、書けなかった理由
+
+    def save_cache(final=False):
+        """控え（records/sessions/raw/.index.json）を、一時ファイルから入れ替えて書く。途中でも書くのは、会話の終わりのフックが
+        止められても、次の実行が初めから読み直さないように。書けなくても止めない（次の実行で読み直すだけ）。
+        途中で一度書けなかったら、終わりまで書かない（読み取り専用などで、毎回待たないため）。"""
+        if saving["err"] and not final:
+            return
+        cache["_v"] = CACHE_VERSION
+        try:
+            write_text(CACHE, json.dumps(cache, ensure_ascii=False))
+            saving["err"] = None
+        except OSError as e:
+            saving["err"] = e.strerror or (str(e.args[0]) if e.args else type(e).__name__)
+        saving["n"], saving["t"] = 0, time.time()
+
+    def maybe_save_cache():
+        """読み直した会話が CACHE_SAVE_EVERY 件になるか、CACHE_SAVE_SEC 秒たったら、途中までを控えに書く。
+        一つの会話を済ませてから（生の記録を写してから）呼ぶ。"""
+        if saving["n"] >= CACHE_SAVE_EVERY or (saving["n"] and time.time() - saving["t"] > CACHE_SAVE_SEC):
+            save_cache()
 
     def in_scope(cwd):
         if not cwd:
@@ -878,6 +1031,7 @@ def main():
                 return None
             if c.get("skip") and "cwd" in c and not (c.get("talk") and in_scope(c["cwd"])):
                 return None
+        saving["n"] += 1
         p = parse(f)
         talk = any(i["kind"] in ("user", "answer") for i in p["items"])
         if not talk or not in_scope(p["cwd"]):
@@ -896,6 +1050,8 @@ def main():
     failed = []  # 読めなかった・写せなかった会話の記録（ほかの会話は続ける）
     for f in candidate_files(dirs, extra):
         keep_lock()
+        if not a.list:  # 一覧だけのときは写さないので、控えも書かない（写さないまま控えに載ると、次に写し直さないため）
+            maybe_save_cache()  # 前の会話までを済ませた（写した）ところで
         sid = f.stem
         seen8.add(sid[:8])
         seen_ids.add(sid)
@@ -984,14 +1140,15 @@ def main():
         ts_own = sorted(s["ts"][i] for i in own if s["ts"][i])
         te_own = sorted(te[i] for i in own if te[i])
         talk_own = sorted(s["ts"][i] for i in own if s["ts"][i] and kinds[i] in ("user", "answer"))
-        first = local(ts_own[0]) if ts_own else None
-        last = local(te_own[-1]) if te_own else None
+        # 読めない時刻（1970 年より前など）は飛ばし、読める時刻の最初と最後を使う
+        first = readable(ts_own)
+        last = readable(reversed(te_own))
         s["own_idx"] = own
         file, clash = pick_file(s, first)
         if file:
             claimed.add(file)
         rows[s["id"]] = {"id": s["id"], "title": s.get("title", ""), "first": first, "last": last,
-                         "last_talk": local(talk_own[-1]) if talk_own else None,
+                         "last_talk": readable(reversed(talk_own)),
                          "cwd": s.get("cwd"), "n_own": len(own), "file": file, "clash": clash}
 
     if a.list:
@@ -1007,6 +1164,7 @@ def main():
     skipped = []  # 読めなかった・書けなかった要約のファイル
     for s in sessions:
         keep_lock()
+        maybe_save_cache()  # 前の会話の読める形と要約を書いたところで
         r = rows[s["id"]]
         others = {}
         for u in s["uuids"]:
@@ -1028,6 +1186,7 @@ def main():
         own_sig = hashlib.sha1(("\n".join(s["uuids"][i] or "" for i in s["own_idx"]) + "|" +
                                 (parent["file"] if parent else "")).encode("utf-8")).hexdigest()
         if s.get("changed") or not dg.exists() or cache[s["id"]].get("own_sig") != own_sig:
+            saving["n"] += 1
             try:
                 p = s["parsed"] or parse(s["path"])
                 own_set = {s["uuids"][i] for i in s["own_idx"]}
@@ -1063,7 +1222,7 @@ def main():
             else:
                 new = insert_auto(text, block)  # 囲みが消された。本文はそのままで、新しい囲みを入れる
         else:
-            new = f"# 会話の要約：{no_marker(redact(one_line(r['title'], 200)))}\n\n{block}\n{summary_body()}"
+            new = f"# 会話の要約：{no_marker(one_line(redact(r['title']), 200))}\n\n{block}\n{summary_body()}"
         if new != text:
             try:
                 write_text(out, new)
@@ -1098,7 +1257,7 @@ def main():
         r = rows[s["id"]]
         # 並べる鍵は開始の欄（別の PC では、一覧の行の開始の欄で並べるので、同じ順になるように）
         when = f"{r['first']:%Y-%m-%d %H:%M}" if r["first"] else ""
-        title = redact(one_line(r["title"], 200)).replace("|", "／") + ("（分岐）" if r.get("parent") else "")
+        title = table_cell(one_line(redact(r["title"]), 200)) +("（分岐）" if r.get("parent") else "")
         if r["file"]:
             link = f"[{r['file']}]({r['file']})"
             state = ((r.get("until") or "未要約") + ("（**要約が要る**）" if r.get("pending") else "")
@@ -1115,9 +1274,8 @@ def main():
         write_text(OUT / "README.md", "\n".join(idx) + "\n")
     except OSError:
         skipped.append(("README.md", "書けなかった（次の実行でやり直す）"))
-    cache["_v"] = CACHE_VERSION
-    write_text(CACHE, json.dumps(cache, ensure_ascii=False))
-    pend = [r for r in rows_l if r.get("pending")]
+    save_cache(final=True)  # 書けなくても、要約が要る会話は出す
+    pend =[r for r in rows_l if r.get("pending")]
     if a.pending:
         for r in pend:
             lt = r["last_talk"] or r["last"]
@@ -1138,6 +1296,9 @@ def main():
             print(f"  {f}（{why}）")
     if not git_ok and not a.hook:
         print("git が動かなかったので、要約の冒頭の囲み（ハブのコミットの一覧など）は書き換えなかった")
+    if saving["err"] and not a.hook:
+        print(f"控え（records/sessions/raw/{CACHE.name}）を書けなかった（{saving['err']}）。"
+              "ほかは続けた。次の実行では、会話の記録を読み直す")
 
 
 if __name__ == "__main__":
