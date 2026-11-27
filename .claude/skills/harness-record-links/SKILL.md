@@ -14,7 +14,7 @@ description: 研究ハブの記録（相談、実験、会話の要約、決定�
 - **書き込めない記録は飛ばして、知らせる。** 開けない、保存できない、読み出しのみ（どの OS でも）、といったとき。ほかの記録は続ける。
 - **切れたリンクとして出さないもの**：
   - git に入れないフォルダ（`.gitignore` で外したもの。会話の生の記録、`export/` など）へのリンク。この PC にそのフォルダが無くても出さない。別の PC にだけあることがあるため。
-    - `.gitignore` が CRLF だと、無いリンクの先が git の外とみなされ、切れたリンクが出なかった。そのため `.gitattributes` で、`.gitignore` と `.gitattributes` も LF にそろえる。前からあるハブでは、ひな形の更新で入る。更新の後に二つが変更として出たら、`git add --renormalize .gitignore .gitattributes` を行い、`--check` を動かし直す（`INSTALL.md` の 2-5）。
+    - 前の版のスクリプトでは、`.gitignore` が CRLF だと、無いリンクの先が git の外とみなされ、切れたリンクが出なかった。そのため `.gitattributes` で、`.gitignore` と `.gitattributes` も LF にそろえる。いまのスクリプトは、`.gitignore` がどちらの改行でも同じに読む。前からある作業コピーでは、ファイルが書き直されるか取り出し直されるまで、もとの改行のまま残るが、そのままでよい。ひな形の更新の後に二つが変更として出たときだけ、`git add --renormalize .gitignore .gitattributes` を行い、`--check` を動かし直す（`INSTALL.md` の 2-5）。
   - 会話の要約の題の行（1 行目）と、冒頭の `auto` の囲みの中にあるリンクと記録のパス（スクリプトが書いたもの）。無いファイルも無い印も、切れたリンクとして出さない。
   - 自動で作る一覧そのもの（`records/links.md`、`chats/README.md`、`records/sessions/README.md`）へのリンク。
 - **`{{…}}` は、リンクを探すときに読まない。** ひな形の書き込み欄を、リンクと取り違えないため。
