@@ -8,6 +8,8 @@
 - 履歴は読むだけで、書き換えない。
 - 履歴の場所は ~/.claude/projects/<作業ディレクトリを記号で置き換えた名前>/*.jsonl。
 - 分岐した会話（fork）は同じ発言を写して持つので、発言の uuid で重複を除く。
+- 発言に付ける [id] は、その発言を書いた会話（分岐・続きのファイルの頭の、写した部分の外にその発言を持つ会話。
+  harness-session-archive の session_archive.py の copied_block と同じ決め方）。決められなければ、行の会話の ID。
 - 研究者の発言として数えるのは、研究者が打った発言、Claude が作業している間に送った発言、
   スラッシュコマンドの名前と引数。サブエージェントへの指示（sidechain）や、ほかの会話からのメッセージ、
   ほかの会話・アプリが送った発言（作業の会話の起動の文など。turnOrigin で見分ける）は除く。
@@ -24,6 +26,7 @@ if sys.version_info < (3, 10):
     sys.exit("claude_history: Python 3.10 以降が要る（いまは %d.%d）" % sys.version_info[:2])
 
 import argparse
+import importlib.util
 import json
 import os
 import re
@@ -168,15 +171,49 @@ def first_cwd(f: Path):
     return None
 
 
+def load_copied_block():
+    """session_archive.py（harness-session-archive）の copied_block（ファイルの頭の、ほかの会話から写した部分）を、
+    同じ決め方を使うために読み込む。読み込むだけで、そのスクリプトの main は動かさず、__pycache__ も作らない。
+    読み込めなければ None（行の会話の ID で出す、前の出し方にする）。"""
+    try:
+        p = Path(__file__).resolve().parents[2] / "harness-session-archive" / "scripts" / "session_archive.py"
+        spec = importlib.util.spec_from_file_location("_session_archive_for_history", p)
+        mod = importlib.util.module_from_spec(spec)
+        keep, sys.dont_write_bytecode = sys.dont_write_bytecode, True
+        try:
+            spec.loader.exec_module(mod)
+        finally:
+            sys.dont_write_bytecode = keep
+        return mod.copied_block
+    except (Exception, SystemExit):
+        return None
+
+
 def scan(files):
     rows, seen_uuid, seen_text = [], set(), set()
+    block = load_copied_block()
+    # 行の uuid -> その行を、写した部分の外に持つ会話（その行を書いた会話）。二つ以上あれば（形の崩れた記録）、
+    # 行の会話の ID が自分のもの、会話の ID の順
+    writer = {}
     for f in files:
+        raw, nou = [], None  # session_archive.py の parse と同じ：uuid のある行の (uuid, 行の会話の ID, 時刻, 印)
         with open(f, encoding="utf-8", errors="replace") as fh:
             for d in records(fh):
+                if block is not None and not d.get("isSidechain"):
+                    u_ = d.get("uuid") if isinstance(d.get("uuid"), str) else None
+                    ts_ = d.get("timestamp") if isinstance(d.get("timestamp"), str) else None
+                    if u_:
+                        s_, a_ = d.get("sessionId"), d.get("attachment")
+                        mark = ("fb" if d.get("type") == "attachment" and isinstance(a_, dict) and a_.get("type") == "fork_briefing"
+                                else "cb" if d.get("type") == "system" and d.get("subtype") == "compact_boundary" else None)
+                        raw.append((u_, s_ if isinstance(s_, str) and s_ else f.stem, ts_, mark))
+                    elif ts_ and nou is None:
+                        nou = ts_
                 t = user_text(d)
                 if not t:
                     continue
-                # 出す [id] は、行の会話の ID（分岐で写した行は、写した元の会話の ID を持つ）。無ければファイルの会話
+                # 出す [id] は、その行を書いた会話（下の writer）。分からなければ、行の会話の ID（ID を変えずに写した
+                # 分岐の行は、写した元の会話の ID を持つ）。無ければファイルの会話
                 s_ = d.get("sessionId")
                 sid = (s_ if isinstance(s_, str) and s_ else f.stem)[:8]
                 dt = local_time(d.get("timestamp", ""))
@@ -192,7 +229,18 @@ def scan(files):
                     if key in seen_text:
                         continue
                     seen_text.add(key)
-                rows.append((dt, sid, f.parent.name, t, d.get("type") == "attachment"))
+                rows.append((dt, sid, f.parent.name, t, d.get("type") == "attachment", u))
+        if block is not None:
+            try:
+                n = block(raw, f.stem, nou)
+            except Exception:
+                n = None  # 決められなければ、このファイルの行は前の出し方にする
+            if n is not None:
+                for u_, s_, _, _ in raw[n:]:
+                    cand = (s_ != f.stem, f.stem)
+                    if u_ not in writer or cand < writer[u_]:
+                        writer[u_] = cand
+    rows = [(dt, writer[u][1][:8] if u in writer else sid, folder, t, q) for dt, sid, folder, t, q, u in rows]
     # 作業中に送った発言が、その時刻から 10 分以内に、同じ会話で同じ本文の普通の発言として後に記録されていれば、
     # 普通の発言の方だけを残す。一つの普通の発言で除けるのは、作業中に送った発言の一つだけ（続けて送った「はい」を、
     # まとめて消さないため）。前にある普通の発言では除かない。普通の発言どうしは、同じ本文が続いても消さない

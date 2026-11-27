@@ -5,7 +5,8 @@
   研究者の発言・Claude の返答の本文・道具の呼び出しの 1 行・選択肢での質問と回答を、時刻と uuid つきで載せる。
   ほかの会話・アプリが送った発言（turnOrigin で見分ける）は、そうと分かる見出しで載せ、研究者の発言には数えない。
   分岐・続きの会話は、各行を、それを最初に書いた会話に持たせ、同じ行を二重に載せない。
-  各ファイルの頭の、ほかの会話から写した部分（copied_block）を、ファイルの形だけから決め、行の持ち主は、その行を
+  各ファイルの頭の、ほかの会話から写した部分（copied_block）を、ファイルの形（続きでは、Claude Code のフォルダで
+  初めて読んだときに控えた、ファイルの作られた時刻も）から決め、行の持ち主は、その行を
   写した部分の外に持つ会話とする。分岐元は、写した部分の最後の行の持ち主。持ち主がいま無い行は、持つ会話のうち
   元に最も近いものが載せる（ownership）。
 - 要約のファイル records/sessions/<開始日>_<ID の先頭 8 文字>.md（git で管理）を用意する。
@@ -402,8 +403,8 @@ def fallback_title(text: str) -> str:
     return one_line(redact(text), 40)
 
 
-def parse(path: Path):
-    """会話を、発言の並び（uuid、種類、時刻、本文）に直す。"""
+def parse(path: Path, birth=None):
+    """会話を、発言の並び（uuid、種類、時刻、本文）に直す。birth は、会話のファイルの作られた時刻（copied_block）。"""
     sid, cwd, title_c, title_a = path.stem, None, None, None
     items, ask_ids = [], {}
     raw, nou = [], None  # uuid のある行の (uuid, 行の会話の ID, 時刻, 印)、uuid の無い行の最初の時刻
@@ -527,7 +528,7 @@ def parse(path: Path):
     times = [local(i.get("te") or i["ts"]) for i in items]
     first = next((local(i["ts"]) for i in items if local(i["ts"])), None)
     last = max((t for t in times if t), default=None)
-    blk = copied_block(raw, sid, nou)
+    blk = copied_block(raw, sid, nou, birth)
     return {"id": sid, "cwd": cwd, "title": title, "items": items, "first": first, "last": last,
             "raw": [r[0] for r in raw], "blk": blk,
             # 写した部分の後ろで、行の会話の ID がほかの会話のもの（持ち主が決まらないときに、後回しにする）
@@ -542,13 +543,38 @@ def _instant(ts):
         return None
 
 
-def copied_block(raw, sid, nou):
+BIRTH_SLACK = 2  # 秒。続きの自分の最初の行は、ファイルが作られた時刻より少し前の時刻を持つことがある
+
+
+def birth_time(st):
+    """ファイルの作られた時刻（エポック秒）。Windows と macOS のほかでは分からないので None。"""
+    b = getattr(st, "st_birthtime", None)
+    if b is None and os.name == "nt":
+        b = st.st_ctime  # Python 3.12 より前の Windows では、st_ctime が作られた時刻
+    return float(b) if isinstance(b, (int, float)) and not isinstance(b, bool) and b > 0 else None
+
+
+def _birth_instant(birth):
+    """作られた時刻の BIRTH_SLACK 秒前（時間帯つき）。分からなければ None。"""
+    if birth is None:
+        return None
+    try:
+        return datetime.fromtimestamp(birth - BIRTH_SLACK, timezone.utc)
+    except (ValueError, OSError, OverflowError, TypeError):
+        return None
+
+
+def copied_block(raw, sid, nou, birth=None):
     """ファイルの頭の、ほかの会話から写した行の数（raw の位置で。これより後ろが、この会話の書いた行）。
     - 分岐（写した行が元の会話の ID のまま）：頭の、行の会話の ID がほかの会話のものの並び
     - 分岐（写した行に新しい ID を付け、写した部分の後ろに fork_briefing を置く）：最後の fork_briefing より前
     - 続き（元の会話の最後の要約の境目（compact_boundary）の写しで始まる）：頭の、続きを始めた時刻
       （uuid の無い、時刻のある最初の行。無ければ境目の時刻）より前の行（境目、要約、要約の後に残した部分、
-      境目の後の元の会話の行）。最後の行が fork_briefing なら、それは自分の行
+      境目の後の元の会話の行）。ファイルの作られた時刻 birth（エポック秒。分かるときだけ）の BIRTH_SLACK 秒前が、
+      その時刻より前なら、その時刻より前の行（CLI では、uuid の無い行が、続きの自分の最初の発言の後にしか無いことが
+      ある）。作られた時刻は写した部分を短くするだけで、ほかの PC から写したファイルのように後ろなら使わない。
+      ただし uuid の無い時刻つきの行が一つも無く、作られた時刻が最後の行の時刻より後ろでなければ、境目の時刻の
+      代わりに、作られた時刻の BIRTH_SLACK 秒前を使う。最後の行が fork_briefing なら、それは自分の行
     当てはまるもののうち、いちばん長いもの。"""
     k = 0
     while k < len(raw) and raw[k][1] != sid:
@@ -557,7 +583,16 @@ def copied_block(raw, sid, nou):
     n = max(k, fb[-1] if fb else 0)
     if k == 0 and raw and raw[0][3] == "cb":
         lim = _instant(nou) if nou else None
+        b = _birth_instant(birth)
+        if lim is None and b is not None:
+            # uuid の無い時刻つきの行が無い：境目の時刻は当てにならないので、作られた時刻が続きを始めた時刻として
+            # ありうる（最後の行の時刻より後ろでない。後ろなら、ほかから写したファイル）なら、それを使う
+            last = max((x for x in map(_instant, (r[2] for r in raw)) if x is not None), default=None)
+            if last is not None and b + timedelta(seconds=BIRTH_SLACK) <= last:
+                lim = b
         lim = lim or _instant(raw[0][2])
+        if lim is not None and b is not None and b < lim:
+            lim = b
         t = 1
         while lim is not None and t < len(raw) and (_instant(raw[t][2]) or lim) < lim:
             t += 1
@@ -971,10 +1006,16 @@ NOT_SUMMARIZED_RX = re.compile(r"^- 要約した範囲：\s*要約しない", re
 
 
 # 「要約した範囲」の日時。秒があってもよい。後ろに時差があってもよい：空白の後ろに「+09:00」「+0900」「+09」「-05:00」
-# 「Z」（符号は全角の「＋」「−」も）、または括弧の中（「（+09:00）」）。「+」と「Z」は、空白が無くてもよい（前と同じ）。
-# 空白も括弧も無い「-」（「10:00-11:30」）は範囲の印として読み、時差にしない
+# 「Z」（符号は全角の「＋」「−」「－」も）、または括弧の中（「（+09:00）」）。「+」と「Z」は、空白が無くてもよい（前と同じ）。
+# 空白も括弧も無い「-」（「10:00-11:30」）は範囲の印として読み、時差にしない。
+# 時差として読むのは、実際にある時差だけ：−12 から +14 までのちょうどの時と、使われている 30 分・45 分のずれ
+# （「10:00 -11:30」の「-11:30」は時差にしない）
+_OFF_POS = r"(?:0\d|1[0-4])(?::?00)?|(?:0[3-6]|09|10):?30|(?:05|08|12|13):?45"
+_OFF_NEG = r"(?:0\d|1[0-2])(?::?00)?|(?:0[23]|09):?30"
+_OFF_END = r"(?![0-9:A-Za-z])"
 _TIME = r"(\d{1,2}):(\d{2})(?::(\d{2}))?(?![0-9])"
-_OFF_BODY = r"(?:([+\-＋−])(\d{2})(?::?(\d{2}))?|(Z))(?![0-9:A-Za-z])"
+_OFF_BODY = (rf"(?:([+＋](?=(?:{_OFF_POS}){_OFF_END})|[\-−－](?=(?:{_OFF_NEG}){_OFF_END}))(\d{{2}})(?::?(\d{{2}}))?|(Z))"
+             + _OFF_END)
 _OFF = rf"(?:(?:[ \t　]+|(?=[+＋Z])){_OFF_BODY}|[ \t　]*[(（][ \t　]*{_OFF_BODY}[ \t　]*[)）])?"
 UNTIL_RX = re.compile(rf"(\d{{4}}-\d{{2}}-\d{{2}}) {_TIME}{_OFF}")
 # 日時の後ろの「〜 11:30」（同じ日の時刻で終わる範囲）。「〜」「～」か、前後に空白のある「-」で区切ったもの
@@ -983,7 +1024,8 @@ UNTIL_TAIL_RX = re.compile(rf"(?:[ \t　]*[〜～][ \t　]*|[ \t　]+-[ \t　]+)
 
 def _until_match(text):
     """「要約した範囲」の行の最後の日時の (日付, 時, 分, 秒か None, 時差の分か None)。日時の後ろに「〜 11:30」が続けば、
-    終わりはその日付のその時刻（時差が無ければ、前の日時の時差）。読めなければ None。"""
+    終わりはその日付のその時刻（時差が無ければ、前の日時の時差）。その時刻が前の日時の時刻より前なら、次の日の時刻
+    （「2026-01-10 23:00 〜 01:30」）。読めなければ None。"""
     m = re.search(r"^- 要約した範囲：(.*)$", text, re.M)
     if not m:
         return None
@@ -996,9 +1038,15 @@ def _until_match(text):
     off = _offset(g[3:])
     t = UNTIL_TAIL_RX.match(line, f.end())
     if t:
+        start = (int(g[0]), int(g[1]), int(g[2] or 0))
         g = t.groups()
         o = _offset(g[3:])
         off = off if o is None else o
+        if (int(g[0]), int(g[1]), int(g[2] or 0)) < start:
+            try:
+                d = (datetime.strptime(d, "%Y-%m-%d") + timedelta(days=1)).strftime("%Y-%m-%d")
+            except (ValueError, OverflowError):
+                pass  # 読めない日付は、前と同じに読む（until_instant が読めない時刻とする）
     return d, int(g[0]), int(g[1]), (int(g[2]) if g[2] else None), off
 
 
@@ -1009,7 +1057,7 @@ def _offset(g):
             return 0
         if sg:
             v = int(oh) * 60 + int(om or 0)
-            return -v if sg in "-−" else v
+            return -v if sg in "-−－" else v
     return None
 
 
@@ -1277,8 +1325,13 @@ def load_cache():
         c = json.loads(CACHE.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return {}  # 無い、または壊れている：すべてを読み直す
-    if not isinstance(c, dict) or c.get("_v") != CACHE_VERSION:
+    if not isinstance(c, dict):
         return {}
+    if c.get("_v") != CACHE_VERSION:
+        # 版が変わっても、控えた会話のファイルの作られた時刻（take）は残す（Claude Code のファイルが消えた後は、
+        # もう分からないため）。その会話は読み直す
+        return {k: {"key": [], "birth": v["birth"]} for k, v in c.items()
+                if isinstance(v, dict) and isinstance(v.get("birth"), (int, float)) and not isinstance(v["birth"], bool)}
     # 中身の形がおかしい項目は捨てる（その会話は読み直す）
     return {k: v for k, v in c.items() if k == "_v" or (isinstance(v, dict) and isinstance(v.get("key"), list))}
 
@@ -1462,22 +1515,34 @@ def main():
         st = f.stat()
         key = [st.st_size, int(st.st_mtime)]
         c = cache.get(sid)
+        # 会話のファイルの作られた時刻（続きの、写した部分を決める。copied_block）。Claude Code のフォルダで初めて読んだ
+        # ときのものを控えに残し、その後は変えない（ハブの写しの作られた時刻は、写した時刻なので使わない）
+        b = c.get("birth") if c else None
+        known = isinstance(b, (int, float)) and not isinstance(b, bool)
+        birth = b if known else (birth_time(st) if f.resolve().parent != raw_dir else None)
+
+        def with_birth(e):
+            if birth is not None:
+                e["birth"] = birth
+            return e
         # 対象かどうかは、記録した作業ディレクトリ（cwd）を、いまの hub/session-sources.txt と毎回照らして決め直す。
-        # 作業ディレクトリを足したり外したりしても、会話のファイルを読み直さずに反映されるようにするため
-        if c and c.get("key") == key:
+        # 作業ディレクトリを足したり外したりしても、会話のファイルを読み直さずに反映されるようにするため。
+        # 作られた時刻が初めて分かった対象の会話は、写した部分を決め直すために読み直す
+        if c and c.get("key") == key and not ("raw" in c and birth is not None and not known):
             if "raw" in c:
                 if in_scope(c.get("cwd")):
                     return {"id": sid, "path": f, "parsed": None, **c}
-                cache[sid] = {"key": key, "skip": True, "cwd": c.get("cwd"), "talk": True}
+                cache[sid] = with_birth({"key": key, "skip": True, "cwd": c.get("cwd"), "talk": True})
                 return None
             if c.get("skip") and "cwd" in c and not (c.get("talk") and in_scope(c["cwd"])):
+                with_birth(c)
                 return None
         saving["n"] += 1
-        p = parse(f)
+        p = parse(f, birth)
         # ほかの会話が送った起動の文（sent）だけの会話も対象にする（切り出した作業の会話を残すため）
         talk = any(i["kind"] in ("user", "answer", "sent") for i in p["items"])
         if not talk or not in_scope(p["cwd"]):
-            cache[sid] = {"key": key, "skip": True, "cwd": p["cwd"], "talk": talk}
+            cache[sid] = with_birth({"key": key, "skip": True, "cwd": p["cwd"], "talk": talk})
             return None
         # 持ち主を決めるのに要るのは、ファイルの形だけ：uuid のある行の並び（raw）、写した部分の行の数（blk）、
         # 各項目の行の raw での位置（ri。Claude の返答は、まとめた行ごと）と、まとめた行の時刻（rt）
@@ -1486,7 +1551,7 @@ def main():
                  "rt": {str(k): [x["ts"] for x in i["parts"]] for k, i in enumerate(p["items"]) if len(i.get("parts") or ()) > 1},
                  "kinds": [i["kind"] for i in p["items"]], "ts": [i["ts"] for i in p["items"]],
                  "te": [i.get("te") or i["ts"] for i in p["items"]], "changed": True}
-        cache[sid] = entry
+        cache[sid] = with_birth(entry)
         return {"id": sid, "path": f, "parsed": p, **entry}
 
     sessions = []
