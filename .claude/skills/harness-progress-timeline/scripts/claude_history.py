@@ -9,7 +9,8 @@
 - 履歴の場所は ~/.claude/projects/<作業ディレクトリを記号で置き換えた名前>/*.jsonl。
 - 分岐した会話（fork）は同じ発言を写して持つので、発言の uuid で重複を除く。
 - 研究者の発言として数えるのは、研究者が打った発言、Claude が作業している間に送った発言、
-  スラッシュコマンドの名前と引数。サブエージェントへの指示（sidechain）や、ほかの会話からのメッセージは除く。
+  スラッシュコマンドの名前と引数。サブエージェントへの指示（sidechain）や、ほかの会話からのメッセージ、
+  ほかの会話・アプリが送った発言（作業の会話の起動の文など。turnOrigin で見分ける）は除く。
 - 出力には研究の中身がそのまま入る。git に入れない場所に書くこと。
 """
 from __future__ import annotations
@@ -115,9 +116,24 @@ def clean(content) -> str:
     return t
 
 
+def not_typed(d: dict) -> bool:
+    """user の行が、研究者が打ったものではなく、ほかの会話かアプリが送ったものか（session_archive.py の not_typed と同じ）。
+    確かめられた形だけを数える：turnOrigin が host_synthetic（ほかの会話が始めた会話の最初の発言）、
+    turnOrigin が sdk で、Agent SDK から始めた会話（entrypoint が sdk-cli）か、その実行の最初の発言（promptIndex が 0）。"""
+    to = d.get("turnOrigin")
+    if to == "host_synthetic":
+        return True
+    if to == "sdk":
+        tp = d.get("turnPosition")
+        return d.get("entrypoint") == "sdk-cli" or (isinstance(tp, dict) and tp.get("promptIndex") == 0)
+    return False
+
+
 def user_text(d: dict) -> str:
     if d.get("isSidechain"):
         return ""  # サブエージェントへの指示は、研究者の発言ではない
+    if d.get("type") == "user" and not_typed(d):
+        return ""  # ほかの会話・アプリが送った発言（切り出した作業の起動の文など）
     if d.get("type") == "attachment":
         a = d.get("attachment")
         a = a if isinstance(a, dict) else {}
