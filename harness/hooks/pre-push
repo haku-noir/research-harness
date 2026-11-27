@@ -13,13 +13,18 @@
 remote="$1"
 url="$2"
 
-# URL の書き方の揺れをそろえる（https://github.com/o/r.git、git@github.com:o/r、https://github.com/o/r/ を同じとみなす）：
-# 小文字にし、方式（https:// など）と「ユーザー@」を外し、「ホスト:パス」を「ホスト/パス」にし、末尾の「/」と「.git」を外す
+# URL の書き方の揺れをそろえる（https://github.com/o/r.git、git@github.com:o/r、https://github.com/o/r/、
+# ssh://git@github.com:22/o/r.git、https://github.com:443/o/r、git@github.com:/o/r.git を同じとみなす）：
+# 小文字にし、方式（https:// など）のある形ではポート（:22 など）を外し、方式と「ユーザー@」を外し、
+# 「ホスト:パス」を「ホスト/パス」にし、続いた「/」を一つにし、末尾の「/」と「.git」を外す
 norm_url() {
   printf '%s\n' "$1" | tr 'A-Z' 'a-z' | sed \
+    -e 's#^\([a-z][a-z0-9+.-]*://[^/]*\):[0-9]*/#\1/#' \
+    -e 's#^\([a-z][a-z0-9+.-]*://[^/]*\):[0-9]*$#\1#' \
     -e 's#^[a-z][a-z0-9+.-]*://##' \
     -e 's#^[^@/]*@##' \
     -e 's#^\([^/:]*\):#\1/#' \
+    -e 's#//*#/#g' \
     -e 's#/*$##' \
     -e 's#\.git$##' \
     -e 's#/*$##'
