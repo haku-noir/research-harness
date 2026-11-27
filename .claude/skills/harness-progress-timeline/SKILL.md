@@ -35,7 +35,7 @@ description: 研究の進捗を日付ごとに整理し、何が変わったか�
    git tag --sort=creatordate               （見せた版のタグ）
    ```
 
-   取り込んだ git（`archive/…` のブランチ）がある場合、取り込みより前の経緯はそのブランチの履歴にある（`git log archive/<名前>/<ブランチ>`）。`hub/profile.md` の「取り込んだ履歴」を見る。
+   取り込んだ git（`archive/…` のブランチ）がある場合、取り込みより前の経緯はそのブランチの履歴にある（`git log archive/<名前>/<ブランチ>`）。別の PC で複製したハブでは、そのブランチは `origin/archive/<名前>/<ブランチ>` としてだけあるので、`git log origin/archive/<名前>/<ブランチ>` で見る（`harness-install` の 3）。`hub/profile.md` の「取り込んだ履歴」を見る。
 
 2. **ハブの記録**：
    - `records/meetings/*/README.md`
