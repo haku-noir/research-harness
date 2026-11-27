@@ -30,11 +30,41 @@ from collections import Counter
 from datetime import datetime
 from pathlib import Path
 
-REMINDER_RX = re.compile(r"<system-reminder>.*?</system-reminder>", re.S)
 SKIP_PREFIXES = (
     "<system-reminder", "<local-command", "<side-sessions",
     "<task-notification", "[Request interrupted", "<ci-monitor-event", "<user-prompt-submit-hook",
 )
+
+
+def strip_reminders(t: str) -> str:
+    """<system-reminder> 〜 </system-reminder> の囲みを除く（re.sub の「.*?」と同じ結果）。
+    str.find で探す（閉じていない始まりの印が多く並んでも、印ごとに終わりまで読み直さないため）。"""
+    o, c = "<system-reminder>", "</system-reminder>"
+    if o not in t:
+        return t
+    out, pos = [], 0
+    while True:
+        i = t.find(o, pos)
+        if i == -1:
+            break
+        j = t.find(c, i + len(o))
+        if j == -1:
+            break  # 閉じていない（後ろの始まりの印も閉じていない）
+        out.append(t[pos:i])
+        pos = j + len(c)
+    out.append(t[pos:])
+    return "".join(out)
+
+
+def tag_text(t: str, name: str):
+    """<name> 〜 </name> の間の字（re.search の「<name>(.*?)</name>」と同じ）。無ければ None。
+    閉じた印のある最初の始まりの印は、いつも最初の始まりの印なので、str.find で一度だけ探す。"""
+    o, c = f"<{name}>", f"</{name}>"
+    i = t.find(o)
+    if i == -1:
+        return None
+    j = t.find(c, i + len(o))
+    return None if j == -1 else t[i + len(o):j]
 
 
 def encode(path: str) -> str:
@@ -67,17 +97,16 @@ def clean(content) -> str:
                      if isinstance(x, dict) and x.get("type") == "text" and isinstance(x.get("text"), str))
     else:
         t = content if isinstance(content, str) else ""
-    t = REMINDER_RX.sub("", t).strip()
+    t = strip_reminders(t).strip()
     if not t or "This session is being continued" in t[:300]:
         return ""
     if "<command-name>" in t:
         # スラッシュコマンド：引数のあるものだけを、名前と引数で残す。
         # 引数の無いもの（/clear、/exit、/model など）は、研究者の発言として数えない
-        name = re.search(r"<command-name>(.*?)</command-name>", t, re.S)
-        args = re.search(r"<command-args>(.*?)</command-args>", t, re.S)
-        if not (args and args.group(1).strip()):
+        name, args = tag_text(t, "command-name"), tag_text(t, "command-args")
+        if not (args and args.strip()):
             return ""
-        return " ".join(x.group(1).strip() for x in (name, args) if x and x.group(1).strip())
+        return " ".join(x.strip() for x in (name, args) if x and x.strip())
     if t.startswith(SKIP_PREFIXES):
         return ""
     return t
@@ -181,7 +210,7 @@ def cmd_list(base: Path):
 
 def main():
     if hasattr(sys.stdout, "reconfigure"):
-        sys.stdout.reconfigure(encoding="utf-8")
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")  # 書けない字（対になっていないサロゲート）は置き換える
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--base", type=Path, default=Path.home() / ".claude" / "projects")
     ap.add_argument("--list", action="store_true", help="履歴のあるフォルダと、そこで開いた作業ディレクトリの一覧を出す")
@@ -250,7 +279,7 @@ def main():
     text = "\n".join(out) + "\n"
     if a.out:
         a.out.parent.mkdir(parents=True, exist_ok=True)
-        a.out.write_text(text, encoding="utf-8", newline="\n")
+        a.out.write_text(text, encoding="utf-8", errors="replace", newline="\n")  # 書けない字は置き換える
         print(f"書いた: {a.out}（発言 {len(rows)}、日数 {len(days)}）")
     else:
         print(text)

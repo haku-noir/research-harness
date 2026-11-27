@@ -31,6 +31,28 @@ norm_url() {
     -e 's#/*$##'
 }
 
+# 手元のパス（方式のある形の file:// か、方式も「ホスト:」も無い形。C:\… や C:/… のドライブの形も）のリポジトリの git の
+# フォルダ（rev-parse --absolute-git-dir）を出す。手元のパスでないか、リポジトリでなければ何も出さない。
+# 同じリポジトリを別の書き方（「\」、file:// の URL、相対パス）で指しても、同じ値になる
+local_git_dir() {
+  p=$1
+  case "$p" in
+    file://*) p=${p#file://} ;;
+    *://*) return 0 ;;
+    [A-Za-z]:[\\/]*|[A-Za-z]:) ;;
+    *)
+      first=${p%%/*}
+      first=${first%%\\*}
+      case "$first" in *:*) return 0 ;; esac  # ホスト:パス の形
+      ;;
+  esac
+  case "$p" in /[A-Za-z]:*) p=${p#/} ;; esac  # file:///C:/… の形
+  [ -z "$p" ] && return 0
+  # 環境の GIT_DIR などに引きずられず、そのパスのリポジトリを聞く
+  (unset GIT_DIR GIT_WORK_TREE GIT_COMMON_DIR GIT_INDEX_FILE GIT_OBJECT_DIRECTORY GIT_NAMESPACE
+   git -C "$p" rev-parse --absolute-git-dir 2>/dev/null) || true
+}
+
 template_url=$(git config --get remote.template.url 2>/dev/null)
 
 nl='
@@ -42,9 +64,12 @@ if [ -n "$template_url" ]; then
     git remote get-url --all template 2>/dev/null
     git remote get-url --push --all template 2>/dev/null)
   template_norms="$nl"
+  template_dirs="$nl"  # 手元のパスのひな形の、git のフォルダ
   while IFS= read -r t; do
     [ -z "$t" ] && continue
     template_norms="$template_norms$(norm_url "$t")$nl"
+    g=$(local_git_dir "$t")
+    [ -n "$g" ] && template_dirs="$template_dirs$g$nl"
   done <<EOF
 $template_urls
 EOF
@@ -63,6 +88,15 @@ EOF
     case "$template_norms" in
       *"$nl$n$nl"*) to_template="yes" ;;
     esac
+    # どちらも手元のパスなら、リポジトリそのもので比べる
+    if [ -z "$to_template" ] && [ "$template_dirs" != "$nl" ]; then
+      g=$(local_git_dir "$c")
+      if [ -n "$g" ]; then
+        case "$template_dirs" in
+          *"$nl$g$nl"*) to_template="yes" ;;
+        esac
+      fi
+    fi
   done <<EOF
 $candidates
 EOF

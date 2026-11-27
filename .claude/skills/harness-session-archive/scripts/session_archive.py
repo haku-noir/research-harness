@@ -9,6 +9,7 @@
   - あれば、冒頭の <!-- auto:start --> 〜 <!-- auto:end --> の間（会話の ID、期間、生の記録への参照、ハブのコミット）だけを書き直す。
     書き直すのは、囲みが最初の「## 」の見出しより前にあり、中身がこのスクリプトの書く形の行だけのときだけ
     （組になった git のぶつかりの印の行は、スクリプトの行とみなす）。崩れていれば触らずに知らせる。
+    囲みの外（最初の「## 」より前）に、ほかの印の行か git のぶつかりの印の行があるときも、崩れているとする。
     囲みの印の行が一つも無ければ（消された）、最初の「# 」の行の後ろ（無ければいちばん上）に新しく入れる。
     印の行（始まりか終わり）が残っていて、正しい囲みになっていなければ、崩れているとして触らずに知らせる。
   - 先頭 8 文字が同じ別の会話の要約（囲みの「会話の ID」が別の会話）は使わない。その会話の要約は作らずに知らせる。
@@ -23,7 +24,7 @@
   python -X utf8 session_archive.py            （全部を更新。変わった会話だけを読み直す）
   python -X utf8 session_archive.py --pending  （更新して、要約が要る会話を出す）
   python -X utf8 session_archive.py --hook     （Claude Code のフックから。標準入力の transcript_path も探す場所に足す。失敗しても 0 で終わる）
-  python -X utf8 session_archive.py --list     （対象の会話を一覧するだけ）
+  python -X utf8 session_archive.py --list     （対象の会話を一覧するだけ。何も書かず、ロックも取らない）
 """
 import sys
 
@@ -66,7 +67,6 @@ SOURCES = HUB / "hub" / "session-sources.txt"
 PROJECTS = Path.home() / ".claude" / "projects"
 TRAILER = "Hub-Session"
 
-REMINDER_RX = re.compile(r"<system-reminder>.*?</system-reminder>", re.S)
 SKIP_PREFIXES = (
     "<system-reminder", "<local-command", "<side-sessions", "<task-notification",
     "[Request interrupted", "<ci-monitor-event", "<user-prompt-submit-hook",
@@ -79,7 +79,9 @@ _NB = r"(?<![A-Za-z0-9])"
 # PEM の秘密鍵（redact_pem）
 PEM_BEGIN_RX = re.compile(r"-----BEGIN (?:[A-Z0-9]+ ){0,4}PRIVATE KEY-----")
 PEM_END_RX = re.compile(r"-----END (?:[A-Z0-9]+ ){0,4}PRIVATE KEY-----")
-PEM_BODY_RX = re.compile(r"(?:[ \t]*\r?\n?[ \t]*[A-Za-z0-9+/=]{16,})*")
+# 鍵の字の行の並び。行の間の空白は、改行の前と後ろで分けて読む（空白の続きを二通りに分けて読み直さないため。
+# 長い空白の後ろに鍵の字が無いとき、遅くならないように）
+PEM_BODY_RX = re.compile(r"(?:[ \t]*(?:(?:\r\n?|\n)[ \t]*)?[A-Za-z0-9+/=]{16,})*")
 PEM_MAX = 16384  # 始まりの行から、終わりの行までの長さの上限
 SECRET = [
     # 英数字だけで、前半は 64 字まで（日本語は \w に入るので、長い日本語の並びを読みに行かないように）
@@ -248,20 +250,50 @@ def message_text(content):
     return content if isinstance(content, str) else ""
 
 
+def strip_reminders(t: str) -> str:
+    """<system-reminder> 〜 </system-reminder> の囲みを除く（re.sub の「.*?」と同じ結果）。
+    str.find で探す（閉じていない始まりの印が多く並んでも、印ごとに終わりまで読み直さないため）。"""
+    o, c = "<system-reminder>", "</system-reminder>"
+    if o not in t:
+        return t
+    out, pos = [], 0
+    while True:
+        i = t.find(o, pos)
+        if i == -1:
+            break
+        j = t.find(c, i + len(o))
+        if j == -1:
+            break  # 閉じていない（後ろの始まりの印も閉じていない）
+        out.append(t[pos:i])
+        pos = j + len(c)
+    out.append(t[pos:])
+    return "".join(out)
+
+
+def tag_text(t: str, name: str):
+    """<name> 〜 </name> の間の字（re.search の「<name>(.*?)</name>」と同じ）。無ければ None。
+    閉じた印のある最初の始まりの印は、いつも最初の始まりの印なので、str.find で一度だけ探す。"""
+    o, c = f"<{name}>", f"</{name}>"
+    i = t.find(o)
+    if i == -1:
+        return None
+    j = t.find(c, i + len(o))
+    return None if j == -1 else t[i + len(o):j]
+
+
 def user_text(content):
     """研究者の発言の（本文, 種類）。先に <system-reminder> の囲みを除いてから、機械が足した行かを判定する。
     種類は user（研究者の発言）か command（引数の無いスラッシュコマンド）。
     引数のあるコマンド（「/harness-dispatch 実装を進めたい」）は研究者の発言として user にする。
     引数の無いコマンドは読める形に残すが、研究者が話したかどうか（記録の対象か、要約が要るか）の判定には入れない
     （/exit や /clear で数えないため）。"""
-    t = REMINDER_RX.sub("", message_text(content)).strip()
+    t = strip_reminders(message_text(content)).strip()
     if not t:
         return "", None
     if "<command-name>" in t:
-        name = re.search(r"<command-name>(.*?)</command-name>", t, re.S)
-        args = re.search(r"<command-args>(.*?)</command-args>", t, re.S)
-        text = " ".join(x.group(1).strip() for x in (name, args) if x and x.group(1).strip())
-        return text, ("user" if args and args.group(1).strip() else "command")
+        name, args = tag_text(t, "command-name"), tag_text(t, "command-args")
+        text = " ".join(x.strip() for x in (name, args) if x and x.strip())
+        return text, ("user" if args and args.strip() else "command")
     if t.startswith(SKIP_PREFIXES):
         return "", None
     return t, "user"
@@ -523,9 +555,13 @@ def find_auto(text: str):
     「## 」より後ろにだけ始まりの印の行があるときも、崩れているとする（囲みが動かされた）。
     始まりの印の行より前に終わりの印の行があるときと、
     正しい囲みが無く、コードの外に印の行（始まりか終わり）が一つでもあるときは、崩れているとする（終わりの印だけが残った要約に、
-    二つ目の囲みを入れて、前にスクリプトが書いた行を本文に残さないため）。None は、印の行が一つも無いときだけ。"""
-    off, fence, start, conf = 0, False, None, []
-    for line in text.split("\n"):
+    二つ目の囲みを入れて、前にスクリプトが書いた行を本文に残さないため）。None は、印の行が一つも無いときだけ。
+    正しい囲みがあっても、最初の「## 」の見出しより前のコードの外に、ほかの印の行か、囲みの外の git のぶつかりの印の行が
+    あれば、崩れているとする（ぶつかった所が囲みの前から始まり、囲みが二つ写ったときに、一つ目だけを書き直して、
+    ぶつかりの印と二つ目を残さないため）。"""
+    off, fence, start, conf, pre_conflict = 0, False, None, [], False
+    lines = text.split("\n")
+    for k, line in enumerate(lines):
         if start is None:
             if line.lstrip().startswith(("```", "~~~")):
                 fence = not fence
@@ -537,10 +573,14 @@ def find_auto(text: str):
                 elif line.startswith("## "):
                     # 見出しより後ろの始まりの印は、冒頭の囲みとはみなさない
                     return "broken" if _marker_outside_code(text) else None
+                elif CONFLICT_RX.match(line):
+                    pre_conflict = True
         else:
             if AUTO_END_RX.match(line):
                 if conf and not conflict_ok(conf):
                     return "broken"  # ぶつかった所が囲みの外まで続いている
+                if pre_conflict or _marker_before_heading(lines[k + 1:]):
+                    return "broken"  # 囲みの外の、ぶつかりの印か、二つ目の囲みの印がある
                 return start, off + len(line)
             if CONFLICT_RX.match(line):
                 conf.append(line)
@@ -585,6 +625,21 @@ def _marker_outside_code(text: str) -> bool:
             fence = not fence
         elif not fence and (AUTO_START_RX.match(line) or AUTO_END_RX.match(line)):
             return True
+    return False
+
+
+def _marker_before_heading(lines) -> bool:
+    """行の並びの、最初の「## 」の見出しより前のコード（``` の囲み）の外に、冒頭の囲みの印の行（始まりか終わり）か、
+    git のぶつかりの印の行があるか。"""
+    fence = False
+    for line in lines:
+        if line.lstrip().startswith(("```", "~~~")):
+            fence = not fence
+        elif not fence:
+            if line.startswith("## "):
+                return False
+            if AUTO_START_RX.match(line) or AUTO_END_RX.match(line) or CONFLICT_RX.match(line):
+                return True
     return False
 
 
@@ -713,12 +768,23 @@ def make_temp(d: Path):
     raise FileExistsError("一時ファイルを作れない（同じ名前の一時ファイルが多すぎる）")
 
 
-def same_text(path: Path, text: str) -> bool:
-    """いまのファイルの中身が text と同じか（改行の種類と BOM の有無は問わない）。"""
+def same_text(path: Path, text: str, bom_ok=True) -> bool:
+    """いまのファイルの中身が text と同じか（改行の種類は問わない）。BOM の有無は、bom_ok のときだけ問わない
+    （すべてをスクリプトが作る一覧では、BOM が付いたら書き直す。人の書いた要約は、BOM だけでは書き直さない）。"""
     try:
-        return path.read_text(encoding="utf-8-sig") == text
+        return path.read_text(encoding="utf-8-sig" if bom_ok else "utf-8") == text
     except (OSError, UnicodeDecodeError):
         return False
+
+
+def encodable(text: str) -> str:
+    """UTF-8 で書けない字（対になっていないサロゲート。JSON の「\\ud83d」だけの字など）を「?」に置き換える
+    （一つの字のせいで、書けずに全体が止まらないように）。"""
+    try:
+        text.encode("utf-8")
+        return text
+    except UnicodeEncodeError:
+        return text.encode("utf-8", "replace").decode("utf-8")
 
 
 def write_target(path: Path) -> Path:
@@ -761,12 +827,14 @@ def clean_temps(dirs):
                 pass
 
 
-def write_text(path: Path, text: str):
+def write_text(path: Path, text: str, bom_ok=True):
     """改行は LF にそろえ、その都度ちがう名前の一時ファイルに書いてから入れ替える。
     途中で止まっても壊れたファイルを残さず、同時に動いた別の会話のフックともぶつからない。
-    中身が変わらなければ書かない（core.autocrlf=true で、中身の同じファイルが変更として出ないように）。"""
+    中身が変わらなければ書かない（core.autocrlf=true で、中身の同じファイルが変更として出ないように）。
+    bom_ok が偽なら（すべてをスクリプトが作るファイル）、BOM が付いていれば、中身が同じでも BOM を外して書き直す。"""
+    text = encodable(text)
     path = write_target(path)
-    if same_text(path, text):
+    if same_text(path, text, bom_ok):
         return
     fd, tmp = make_temp(path.parent)
     try:
@@ -804,13 +872,18 @@ def acquire_lock(wait=120):
             fd = os.open(LOCK, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
             os.write(fd, str(os.getpid()).encode("ascii"))
             os.close(fd)
-            atexit.register(lambda: LOCK.unlink(missing_ok=True))
+            _lock_held[0] = True
+            atexit.register(release_lock)
             return True
         except FileExistsError:
             try:
                 if time.time() - LOCK.stat().st_mtime > STALE_SEC:
-                    LOCK.unlink(missing_ok=True)
-                    continue
+                    owner = lock_owner()
+                    # 外す直前に、もう一度古さと中身を確かめる（同時に待っていた別の実行が、古いロックを外して
+                    # 新しく取ったロックを、こちらが外さないように）
+                    if time.time() - LOCK.stat().st_mtime > STALE_SEC and lock_owner() == owner:
+                        LOCK.unlink(missing_ok=True)
+                        continue
             except OSError:
                 pass
             if time.time() > deadline:
@@ -818,11 +891,34 @@ def acquire_lock(wait=120):
             time.sleep(0.2)
 
 
+_lock_held = [False]
+
+
+def lock_owner():
+    """ロックに書かれた、取った実行のプロセスの番号（字のまま）。読めなければ None。"""
+    try:
+        return LOCK.read_text(encoding="ascii", errors="replace").strip()
+    except OSError:
+        return None
+
+
+def release_lock():
+    """ロックを外す。中身がこの実行のプロセスの番号のときだけ（古いとして外された後に、別の実行が取ったロックを消さないため）。"""
+    try:
+        if lock_owner() == str(os.getpid()):
+            LOCK.unlink(missing_ok=True)
+    except OSError:
+        pass
+    _lock_held[0] = False
+
+
 _last_touch = [0.0]
 
 
 def keep_lock():
-    """長く動くとき、ロックが古いものと見なされないように、ときどき時刻を新しくする。"""
+    """長く動くとき、ロックが古いものと見なされないように、ときどき時刻を新しくする。ロックを取っていなければ何もしない。"""
+    if not _lock_held[0]:
+        return
     now = time.time()
     if now - _last_touch[0] > 20:
         try:
@@ -887,8 +983,12 @@ def other_rows(sessions, excludes, seen8, seen_ids, used, skipped):
     要約した範囲の欄は、いつもファイルから決め直す（別の PC で要約したなど、ファイルが変わっていることがあるため）。
     ただし前の行の欄が、決め直した値に印を足したもの（「未要約（**要約が要る**）」など。会話の記録のある PC が付けた）なら、
     前の行の欄をそのまま使う（この PC では要約が要るかを決められず、印を外すと、PC ごとに欄が変わり続けるため）。
+    この PC に記録があり、対象の外になった会話の行は、印を付けない決め直した値にする（印の要るかを決めるのは対象の会話だけ。
+    印を残すと、--pending に出ない会話に印が残り続けるため）。
     前の一覧に同じファイルの行が二つ以上あれば（git の union のマージ）、欄が決め直した値に合う行を使う。
-    要約のファイルの無い行（自分の発言なし、先頭 8 文字が同じ別の会話の要約がある）も、この PC でいまの会話でなければ残す。"""
+    要約のファイルの無い行（自分の発言なし、先頭 8 文字が同じ別の会話の要約がある）も、この PC でいまの会話でなければ残す。
+    除いた会話かは、要約の囲みに「会話の ID」があれば、その ID の全体で確かめる（「! <ID の全体>」で、先頭 8 文字が同じ
+    別の会話の行まで除かないため）。ID が無ければ、先頭 8 文字で確かめる。"""
     cur_ids = {s["id"] for s in sessions}
     cur8 = {s["id"][:8] for s in sessions}
     prev, linkless = {}, {}
@@ -907,16 +1007,23 @@ def other_rows(sessions, excludes, seen8, seen_ids, used, skipped):
             linkless[(m.group("id"), m.group("kind"))] = (m.group("when").strip(), line.rstrip())
     out = []
     on_disk8 = set()
+    file_ids = {}  # ID の先頭 8 文字 -> 要約のファイルの囲みにある会話の ID
     for p in sorted(OUT.glob("*.md")):
         m = SUMMARY_FILE_RX.match(p.name)
         if not m:
             continue
         day, id8 = m.groups()
         on_disk8.add(id8)
-        if p.name in used or any(id8.startswith(x[:8]) for x in excludes):
-            continue
+        if p.name in used:
+            continue  # （いまの会話の先頭 8 文字なので、下の要約のファイルの無い行でも、file_ids は使わない）
         text = read_or_none(p)
         ids = summary_ids(text) if text is not None else []
+        file_ids.setdefault(id8, set()).update(ids)
+        if ids:
+            if any(i.startswith(x) for i in ids for x in excludes):
+                continue
+        elif any(id8.startswith(x[:8]) for x in excludes):
+            continue
         if id8 in cur8 and (not ids or set(ids) & cur_ids):
             continue  # いまの会話の要約の、使っていない写し（前と同じく載せない）
         seen = any(i in seen_ids for i in ids) if ids else id8 in seen8
@@ -931,6 +1038,8 @@ def other_rows(sessions, excludes, seen8, seen_ids, used, skipped):
             fit = [c for c in cands if c[2] == state or c[2].startswith(state + "（")]
             if fit:
                 when, head, cell = max(fit, key=lambda c: len(c[2]))  # 印の付いた方（記録のある PC が書いた方）
+                if seen:
+                    cell = state  # この PC に記録のある、対象の外の会話（印は付けない）
             else:
                 (when, head, _), cell = cands[-1], state
             out.append((when, f"{head}| {cell} |"))
@@ -940,7 +1049,10 @@ def other_rows(sessions, excludes, seen8, seen_ids, used, skipped):
         title = table_cell(one_line(redact(title.strip() or p.stem), 200))
         out.append((day, f"| {day} | {title}{note} | `{id8}` | [{p.name}]({p.name}) | {state} |"))
     for (id8, kind), (when, line) in linkless.items():
-        if id8 in cur8 or any(id8.startswith(x[:8]) for x in excludes):
+        # 行には ID の先頭 8 文字しか無い。除く値が、同じ先頭 8 文字の要約のファイルの会話（ID の全体）を指していれば、
+        # その値はこの行の会話（要約のファイルの無い会話）を指していない
+        if id8 in cur8 or any(id8.startswith(x[:8]) and not (len(x) > 8 and any(i.startswith(x) for i in file_ids.get(id8, ())))
+                              for x in excludes):
             continue  # この PC でいまの会話なら、その会話の行を作り直す
         if kind == NO_OWN and id8 in on_disk8:
             continue  # その後、要約ができた
@@ -950,7 +1062,7 @@ def other_rows(sessions, excludes, seen8, seen_ids, used, skipped):
 
 def main():
     if hasattr(sys.stdout, "reconfigure"):
-        sys.stdout.reconfigure(encoding="utf-8")
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")  # 書けない字（対になっていないサロゲート）は置き換える
     ap = argparse.ArgumentParser()
     ap.add_argument("--hook", action="store_true")
     ap.add_argument("--list", action="store_true")
@@ -978,14 +1090,17 @@ def main():
         return
     dirs, excludes = load_sources()
     roots = [norm(d) for d in dirs]
-    for d in (OUT, RAW, DIGEST):
-        d.mkdir(parents=True, exist_ok=True)
-    # フックからは長く待たない（持ち時間が短いため）。毎回すべてを照らし直すので、次の実行で追いつく
-    if not acquire_lock(20 if a.hook else 120):
-        if not a.hook:
-            print(f"ほかの実行が終わらないので、何もしない（{LOCK} が残っていれば、動いている実行が無いことを確かめて消す）")
-        return
-    clean_temps((OUT, RAW, DIGEST))  # 止められた実行が残した一時ファイル
+    # 一覧だけのとき（--list）は何も書かない：フォルダを作らず、ロックを取らず、一時ファイルを消さず、控えも写しも書かない
+    # （控えはあれば読む）
+    if not a.list:
+        for d in (OUT, RAW, DIGEST):
+            d.mkdir(parents=True, exist_ok=True)
+        # フックからは長く待たない（持ち時間が短いため）。毎回すべてを照らし直すので、次の実行で追いつく
+        if not acquire_lock(20 if a.hook else 120):
+            if not a.hook:
+                print(f"ほかの実行が終わらないので、何もしない（{LOCK} が残っていれば、動いている実行が無いことを確かめて消す）")
+            return
+        clean_temps((OUT, RAW, DIGEST))  # 止められた実行が残した一時ファイル
     cache = load_cache()
     raw_dir = RAW.resolve()
     saving = {"n": 0, "t": time.time(), "err": None}  # 前に控えを書いてから読み直した数と時刻、書けなかった理由
@@ -1048,7 +1163,8 @@ def main():
     seen8 = set()  # この PC にある会話の記録（対象の外のものも含む）の、ID の先頭 8 文字
     seen_ids = set()  # 同じく、会話の ID
     failed = []  # 読めなかった・写せなかった会話の記録（ほかの会話は続ける）
-    for f in candidate_files(dirs, extra):
+    cand = candidate_files(dirs, extra)
+    for f in cand:
         keep_lock()
         if not a.list:  # 一覧だけのときは写さないので、控えも書かない（写さないまま控えに載ると、次に写し直さないため）
             maybe_save_cache()  # 前の会話までを済ませた（写した）ところで
@@ -1087,6 +1203,12 @@ def main():
             print("hub/session-sources.txt の次の行は、どの会話にも当たらなかった（まだ会話が無いか、パスが違う）：")
             for d in idle:
                 print(f"  {d}")
+        stems = [f.stem for f in cand]
+        lone = [x for x in dict.fromkeys(excludes) if not any(s.startswith(x) for s in stems)]
+        if lone:
+            print("hub/session-sources.txt の次の「!」の行は、どの会話にも当たらなかった（ID が違うか、この PC に会話の記録が無い）：")
+            for x in lone:
+                print(f"  ! {x}")
 
     # 各発言の持ち主：発言に記された会話がその発言を持っていればその会話、無ければ最も早い会話
     def first_ts(s):
@@ -1109,11 +1231,14 @@ def main():
         if len(n) > 12 and n[-12] == "_":
             existing.setdefault(n[-11:-3], []).append(n)
     claimed = set()  # この実行で、どれかの会話が使うと決めた要約のファイル
+    claimed8 = {}  # ID の先頭 8 文字 -> この実行で、その先頭 8 文字の会話に最初に決めた要約のファイル
 
     def pick_file(s, first):
         """会話の要約のファイルの名前と、使えなかったときの別の会話の要約の名前 (名前, ぶつかった名前)。
         あるファイル（名前の順）のうち、囲みの「会話の ID」がこの会話のもの、または囲みの無いものを使う。
-        先頭 8 文字が同じ別の会話の要約は使わない（その要約の囲みを、この会話のもので書き換えないため）。"""
+        先頭 8 文字が同じ別の会話の要約は使わない（その要約の囲みを、この会話のもので書き換えないため）。
+        新しく作るのは、この実行で、先頭 8 文字が同じ会話にまだファイルを決めていないときだけ（開始日が違っても。
+        別の実行で初めて見たときと同じに、二つ目の会話の要約は作らず、ぶつかったとして知らせる）。"""
         have = sorted(existing.get(s["id"][:8], []))
         clash = None
         for n in have:
@@ -1130,6 +1255,8 @@ def main():
             return None, clash
         if not first:
             return None, None
+        if s["id"][:8] in claimed8:
+            return None, claimed8[s["id"][:8]]
         n = f"{first:%Y-%m-%d}_{s['id'][:8]}.md"
         return (None, n) if n in claimed else (n, None)
 
@@ -1147,6 +1274,7 @@ def main():
         file, clash = pick_file(s, first)
         if file:
             claimed.add(file)
+            claimed8.setdefault(s["id"][:8], file)
         rows[s["id"]] = {"id": s["id"], "title": s.get("title", ""), "first": first, "last": last,
                          "last_talk": readable(reversed(talk_own)),
                          "cwd": s.get("cwd"), "n_own": len(own), "file": file, "clash": clash}
@@ -1184,7 +1312,7 @@ def main():
         dg = DIGEST / f"{s['id']}.md"
         # 読める形は、会話のファイルが変わったときだけでなく、持ち主の決まり方（分岐元）が変わったときにも作り直す
         own_sig = hashlib.sha1(("\n".join(s["uuids"][i] or "" for i in s["own_idx"]) + "|" +
-                                (parent["file"] if parent else "")).encode("utf-8")).hexdigest()
+                                (parent["file"] if parent else "")).encode("utf-8", "replace")).hexdigest()
         if s.get("changed") or not dg.exists() or cache[s["id"]].get("own_sig") != own_sig:
             saving["n"] += 1
             try:
@@ -1271,7 +1399,7 @@ def main():
         lines.append((when, f"| {when} | {title} | `{r['id'][:8]}` | {link} | {state} |"))
     idx += [line for _, line in sorted(lines + kept, key=lambda x: row_key(*x))]
     try:
-        write_text(OUT / "README.md", "\n".join(idx) + "\n")
+        write_text(OUT / "README.md", "\n".join(idx) + "\n", bom_ok=False)  # すべてをスクリプトが作る一覧
     except OSError:
         skipped.append(("README.md", "書けなかった（次の実行でやり直す）"))
     save_cache(final=True)  # 書けなくても、要約が要る会話は出す

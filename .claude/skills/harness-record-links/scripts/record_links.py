@@ -25,6 +25,7 @@
 - Markdown のリンク（[…](先) と [ ](<先>)）の先を、その記録のフォルダから（無ければハブから）たどり、無ければ出す
 - 印（#d-20260115-143000 の形）が、先の記録に <a id="…"></a> として無ければ出す。見出しへの印は確かめない
 - git の外のもの（records/sessions/raw/、export/）、URL、「*」「{{」を含むものは確かめない
+- スクリプトが作る一覧（records/links.md、chats/README.md、records/sessions/README.md）へのリンクは、まだ無くても出さない
 - 会話の要約の冒頭の囲み（harness-session-archive が書く。コミットの件名や分岐元の題）と、題の行（「# 会話の要約：」。
   40 字で切った題は、パスの途中で終わることがある）の中は、先のファイルや印が無くても出さない（だれも直せない所のため）。
   そこにあるリンクも、先があればリンクとして数える
@@ -66,8 +67,9 @@ LOCK = (HUB / ".git" / "hub-scripts.lock") if (HUB / ".git").is_dir() else (HUB 
 STALE_SEC = 90
 # 会話の要約の「決まったこと」などの印（同じ秒が重なったときの -2 なども）
 ANCHOR_ID_RX = re.compile(r"^[a-z]{1,3}-\d{8}-\d{6}(?:-\d+)?$")
-# リンクの先。<…> で囲まないときは、一段までの対になった括弧を含めてよい（../2026-01-18_D(1)/README.md）
-LINK_RX = re.compile(r"\]\((<[^>\n]+>|(?:[^()\s]|\([^()\s]*\))+)\)")
+# リンクの先。<…> で囲まないときは、一段までの対になった括弧を含めてよい（../2026-01-18_D(1)/README.md）。
+# <…> の中には「<」を含めない（閉じていない「](<」が長い行に並んでも、それぞれから行の終わりまで読み直さないため）
+LINK_RX = re.compile(r"\]\((<[^<>\n]+>|(?:[^()\s]|\([^()\s]*\))+)\)")
 TAIL_RX = re.compile(r"(?:/README\.md)?(?:#([A-Za-z0-9_-]+))?")  # 印は英数字だけ（後ろに続く日本語を印に含めない）
 BARE_RX = re.compile(r"(?<![\w/.-])records/(?:sessions|meetings|experiments|history)/[^\s`)>|、。<>\[\]*…{}]+")
 FENCE_RX = re.compile(r"^(```|~~~).*?^\1[^\n]*$", re.S | re.M)
@@ -152,7 +154,8 @@ def _analyze(text: str):
     - 終わりがあり、中がスクリプトの書く形の行だけで、見出しが前に無い（見出しを書き換えた）→ 崩れている
     - 終わりがあり、スクリプトの書く形の行と、ほかの行が混ざる（囲みの中に書き足した）→ 崩れている
     - 終わりがあり、中にスクリプトの書く形の行が無い（本文に書いた例）、または空で見出しも無い → 本文
-    - 終わりが無く、始まりの後の最初の行（空行を除く）がスクリプトの書く形 → 崩れている。そうでなければ本文
+    - 終わりが無く、前の行（空行を除く）が見出し → 崩れている（中のスクリプトの書く形の行は読み飛ばす）
+    - 終わりが無く、見出しが前に無く、始まりの後の最初の行（空行を除く）がスクリプトの書く形 → 崩れている。そうでなければ本文
     見出しの次の行（空行を除く）が始まりの印でなく、スクリプトの書く形の行か終わりの印なら、始まりの印が消えた → 崩れている。
     始まりと終わりの間にある git のぶつかりの印の行（<<<<<<< など）は、組としてそろっていれば、スクリプトの書く形の行とみなす
     （マージでぶつかった囲みを作り直せるように）。そろっていなければ人の書いた行とみなす。囲みの外の印の行は、ふつうの本文。
@@ -216,6 +219,11 @@ def _analyze(text: str):
             skip.update([s, e, *gens, *conf])
             if headed:
                 skip.add(p)
+        elif headed:
+            # 見出しの後ろの始まりの印に、終わりの印が無い → いつも崩れている（その後ろに人が書いた行があっても、
+            # 二つ目の囲みを足したり、前に書いた逆向きのリンクを、その記録のリンクとして読んだりしないため）
+            broken = True
+            skip.update([s, p, *gens])
         else:
             j = next_nonblank(s)
             while j < e and kinds[j] == "conflict":
@@ -421,7 +429,7 @@ def ignored_by_git(paths):
     try:
         # NUL で区切った bytes で渡す（文字列で渡すと、Windows では改行が CRLF に変わり、パスの末尾に \r が付くため）
         r = subprocess.run(["git", "-C", str(HUB), "check-ignore", "--no-index", "--stdin", "-z"],
-                           input=b"\0".join(x.encode("utf-8") for x in query) + b"\0", capture_output=True, timeout=30)
+                           input=b"\0".join(x.encode("utf-8", "replace") for x in query) + b"\0", capture_output=True, timeout=30)
         return {x.decode("utf-8", "replace").rstrip("/") for x in r.stdout.split(b"\0") if x}
     except (OSError, subprocess.SubprocessError):
         return set()
@@ -454,10 +462,11 @@ def mask_placeholders(text: str) -> str:
     return PLACEHOLDER_RX.sub(lambda m: " " * len(m.group(0)), text)
 
 
-def same_text(p: Path, text: str) -> bool:
-    """いまのファイルの中身が text と同じか（改行の種類と BOM の有無は問わない）。"""
+def same_text(p: Path, text: str, bom_ok=True) -> bool:
+    """いまのファイルの中身が text と同じか（改行の種類は問わない）。BOM の有無は、bom_ok のときだけ問わない
+    （すべてをスクリプトが作る一覧では、BOM が付いたら書き直す。人の書いた記録は、BOM だけでは書き直さない）。"""
     try:
-        return p.read_text(encoding="utf-8-sig") == text
+        return p.read_text(encoding="utf-8-sig" if bom_ok else "utf-8") == text
     except (OSError, UnicodeDecodeError):
         return False
 
@@ -516,11 +525,17 @@ def clean_temps(dirs):
                 pass
 
 
-def write_file(p: Path, text: str):
+def write_file(p: Path, text: str, bom_ok=True):
     """LF で、一時ファイルに書いてから入れ替える。中身が変わらなければ書かない（core.autocrlf=true で、
-    中身の同じファイルが変更として出ないように）。書けなければ OSError（呼ぶ側で、ほかのファイルを続ける）。"""
+    中身の同じファイルが変更として出ないように）。書けなければ OSError（呼ぶ側で、ほかのファイルを続ける）。
+    UTF-8 で書けない字（対になっていないサロゲート）は「?」に置き換える（一つの字のせいで書けなくならないように）。
+    bom_ok が偽なら（すべてをスクリプトが作る一覧）、BOM が付いていれば、中身が同じでも BOM を外して書き直す。"""
+    try:
+        text.encode("utf-8")
+    except UnicodeEncodeError:
+        text = text.encode("utf-8", "replace").decode("utf-8")
     p = write_target(p)
-    if same_text(p, text):
+    if same_text(p, text, bom_ok):
         return
     p.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp = make_temp(p.parent)
@@ -537,10 +552,10 @@ def write_file(p: Path, text: str):
         raise
 
 
-def try_write(p: Path, text: str) -> bool:
+def try_write(p: Path, text: str, bom_ok=True) -> bool:
     """書く。書けなければ知らせるために残して False（一つのファイルのせいで全体を止めない）。"""
     try:
-        write_file(p, text)
+        write_file(p, text, bom_ok)
         return True
     except OSError as e:
         # 理由にはパスを入れない（records/links.md は git に入るので、この PC のパスを書かないため）
@@ -549,19 +564,27 @@ def try_write(p: Path, text: str) -> bool:
 
 
 def bare_path_exists(path: str) -> bool:
-    """リンクにせずに書いた記録のパスが実在するか。後ろに続く説明（「（続きの回）」「の結果」）は名前に含めない。"""
+    """リンクにせずに書いた記録のパスが実在するか。後ろに続く説明（「（続きの回）」「の結果」）は名前に含めない。
+    パスは、名前の中の「#」・空白・括弧で切れて渡されることがある（BARE_RX と、印を分ける「#」）。最後の部分が、
+    実在する名前の頭で、その名前の次の字がそれらの字なら、実在するとみなす（「2026-01-15_相談 #2」の「2026-01-15_相談」）。"""
+    if path in GENERATED:
+        return True  # スクリプトが作る一覧（まだ作られていなくても、切れたとしない）
     cur = HUB
-    for part in [x for x in path.split("/") if x]:
+    parts = [x for x in path.split("/") if x]
+    for k, part in enumerate(parts):
         if (cur / part).exists():
             cur = cur / part
             continue
         if not part[0].isascii():
             return True  # 実在するフォルダの後ろに、日本語や全角の括弧の説明が続いている
         try:
-            heads = [c.name for c in cur.iterdir() if part.startswith(c.name)]
+            names = [c.name for c in cur.iterdir()]
         except OSError:
             return False
-        rest = [part[len(h):] for h in heads]
+        if k == len(parts) - 1 and any(n.startswith(part) and len(n) > len(part)
+                                       and (n[len(part)] in "#()" or n[len(part)].isspace()) for n in names):
+            return True  # 名前の中の「#」・空白・括弧で切れた
+        rest = [part[len(h):] for h in names if part.startswith(h)]
         return any(r and not (ascii_word(r[0]) or r[0] in "-.") for r in rest)
     return True
 
@@ -619,18 +642,39 @@ def acquire_lock(wait=120):
             fd = os.open(LOCK, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
             os.write(fd, str(os.getpid()).encode("ascii"))
             os.close(fd)
-            atexit.register(lambda: LOCK.unlink(missing_ok=True))
+            atexit.register(release_lock)
             return True
         except FileExistsError:
             try:
                 if time.time() - LOCK.stat().st_mtime > STALE_SEC:
-                    LOCK.unlink(missing_ok=True)
-                    continue
+                    owner = lock_owner()
+                    # 外す直前に、もう一度古さと中身を確かめる（同時に待っていた別の実行が、古いロックを外して
+                    # 新しく取ったロックを、こちらが外さないように）
+                    if time.time() - LOCK.stat().st_mtime > STALE_SEC and lock_owner() == owner:
+                        LOCK.unlink(missing_ok=True)
+                        continue
             except OSError:
                 pass
             if time.time() > deadline:
                 return False
             time.sleep(0.2)
+
+
+def lock_owner():
+    """ロックに書かれた、取った実行のプロセスの番号（字のまま）。読めなければ None。"""
+    try:
+        return LOCK.read_text(encoding="ascii", errors="replace").strip()
+    except OSError:
+        return None
+
+
+def release_lock():
+    """ロックを外す。中身がこの実行のプロセスの番号のときだけ（古いとして外された後に、別の実行が取ったロックを消さないため）。"""
+    try:
+        if lock_owner() == str(os.getpid()):
+            LOCK.unlink(missing_ok=True)
+    except OSError:
+        pass
 
 
 _last_touch = [0.0]
@@ -680,7 +724,7 @@ def link_to(src_dir: Path, dst: Path, anchor=None) -> str:
 
 def main():
     if hasattr(sys.stdout, "reconfigure"):
-        sys.stdout.reconfigure(encoding="utf-8")
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")  # 書けない字（対になっていないサロゲート）は置き換える
     hook, check = "--hook" in sys.argv, "--check" in sys.argv
     if not (HUB / "hub").exists():
         return
@@ -716,6 +760,18 @@ def main():
             anchor_cache[dst] = anchors_of(nodes[dst]["path"])
         if a not in anchor_cache[dst]:
             broken.append((src, f"{dst}#{a}", "印が無い"))
+
+    hub_res = resolved(HUB)
+
+    def generated_target(*cs):
+        """たどった先のどれかが、スクリプトが作る一覧（GENERATED）か。"""
+        for c in cs:
+            try:
+                if rel_to(c, hub_res) in GENERATED:
+                    return True
+            except ValueError:
+                pass
+        return False
 
     missing = []  # 先が無いリンク（あとで、git に入れない場所のものを除く）
     broken_blocks = []  # 末尾の囲みが崩れている記録（書き込まない）
@@ -767,6 +823,8 @@ def main():
                 except (OSError, ValueError):
                     continue
                 if hit is None:
+                    if generated_target(c1, c2):
+                        continue  # スクリプトが作る一覧（まだ作られていなくても、切れたとしない）
                     if report:
                         missing.append((src, t, [c1, c2]))
                     continue
@@ -915,7 +973,7 @@ def main():
         cell = "<br>".join(u[2:] for u in users) if users else "（まだ無い）"
         C.append(f"| [{v['label']}]({link_to(chats_md.parent, v['path'])}) | {cell} |")
     if chats_md.parent.exists():
-        try_write(chats_md, "\n".join(C) + "\n")
+        try_write(chats_md, "\n".join(C) + "\n", bom_ok=False)  # すべてをスクリプトが作る一覧
 
     # records/links.md
     links_md = HUB / "records" / "links.md"
@@ -958,7 +1016,7 @@ def main():
                 L += ["指しているもの：", ""] + outs + [""]
             if ins:
                 L += ["指されているもの：", ""] + ins + [""]
-    try_write(links_md, "\n".join(L).rstrip() + "\n")
+    try_write(links_md, "\n".join(L).rstrip() + "\n", bom_ok=False)  # すべてをスクリプトが作る一覧
     if not hook:
         n_edges = sum(len(d) for d in out_edges.values())
         print(f"記録 {len(nodes)} 件、リンク {n_edges} 本。切れたリンク {len(broken)} 件、"
