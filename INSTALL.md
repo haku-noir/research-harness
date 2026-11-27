@@ -121,6 +121,8 @@ python -X utf8 .claude/skills/harness-session-archive/scripts/session_archive.py
 python -X utf8 .claude/skills/harness-record-links/scripts/record_links.py --check
 ```
 
+コミットした後に `git status --short` で `.gitignore` か `.gitattributes` が変更（`M`）として出たら、改行が CRLF のまま残っている（ひな形の `.gitattributes` が、この二つも LF にそろえるようになったため）。`git add --renormalize .gitignore .gitattributes` で LF にそろえて別のコミットにし（説明は `CLAUDE.md` の形。何を変えたか：改行を LF にそろえた）、`record_links.py --check` を動かし直す。`.gitignore` が CRLF だと、無いリンクの先が git の外とみなされ、切れたリンクが出ないため。
+
 ### ひな形が持つファイル
 
 - `CLAUDE.md`、`AGENTS.md`、`INSTALL.md`、`README.md`、`LICENSE`
