@@ -34,6 +34,8 @@ SKIP_PREFIXES = (
     "<system-reminder", "<local-command", "<side-sessions",
     "<task-notification", "[Request interrupted", "<ci-monitor-event", "<user-prompt-submit-hook",
 )
+# Claude Code がスラッシュコマンドの発言に書く印。いまの版は <command-name> から始め、<command-message>、<command-args> と続く
+COMMAND_TAGS = ("<command-name>", "<command-message>", "<command-args>")
 
 
 def strip_reminders(t: str) -> str:
@@ -100,8 +102,9 @@ def clean(content) -> str:
     t = strip_reminders(t).strip()
     if not t or "This session is being continued" in t[:300]:
         return ""
-    if "<command-name>" in t:
-        # スラッシュコマンド：引数のあるものだけを、名前と引数で残す。
+    if t.startswith(COMMAND_TAGS):
+        # スラッシュコマンド（Claude Code が書く印で始まる発言だけ。印を本文に貼った発言は、ふつうの発言として残す）：
+        # 引数のあるものだけを、名前と引数で残す。
         # 引数の無いもの（/clear、/exit、/model など）は、研究者の発言として数えない
         name, args = tag_text(t, "command-name"), tag_text(t, "command-args")
         if not (args and args.strip()):
@@ -172,15 +175,28 @@ def scan(files):
                         continue
                     seen_text.add(key)
                 rows.append((dt, sid, f.parent.name, t, d.get("type") == "attachment"))
-    # 作業中に送った発言が、前後 10 分以内に普通の発言としても記録されていれば、普通の発言の方だけを残す。
-    # 普通の発言どうしは、同じ本文（「はい」など）が続いても消さない
+    # 作業中に送った発言が、その時刻から 10 分以内に、同じ会話で同じ本文の普通の発言として後に記録されていれば、
+    # 普通の発言の方だけを残す。一つの普通の発言で除けるのは、作業中に送った発言の一つだけ（続けて送った「はい」を、
+    # まとめて消さないため）。前にある普通の発言では除かない。普通の発言どうしは、同じ本文が続いても消さない
     said = {}
     for dt, sid, _, t, queued in rows:
         if not queued:
             said.setdefault((sid, re.sub(r"\s+", " ", t)), []).append(dt)
-    out = [r[:4] for r in rows
-           if not (r[4] and any(abs((x - r[0]).total_seconds()) < 600
-                                for x in said.get((r[1], re.sub(r"\s+", " ", r[3])), [])))]
+    for v in said.values():
+        v.sort()
+    used, drop = set(), set()
+    # 時刻の順に、まだ使っていない、いちばん早い普通の発言と組にする
+    for k in sorted((k for k, r in enumerate(rows) if r[4]), key=lambda k: (rows[k][0], k)):
+        key = (rows[k][1], re.sub(r"\s+", " ", rows[k][3]))
+        for n, x in enumerate(said.get(key, [])):
+            d = (x - rows[k][0]).total_seconds()
+            if d >= 600:
+                break
+            if d >= 0 and (key, n) not in used:
+                used.add((key, n))
+                drop.add(k)
+                break
+    out = [r[:4] for k, r in enumerate(rows) if k not in drop]
     out.sort(key=lambda r: r[0])
     return out
 

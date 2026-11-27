@@ -4,6 +4,8 @@
 - 要約するための読める形を records/sessions/raw/digest/<会話の ID>.md に書く（git の外）。
   研究者の発言・Claude の返答の本文・道具の呼び出しの 1 行・選択肢での質問と回答を、時刻と uuid つきで載せる。
   分岐した会話は、各発言を元の会話（記録の各行の sessionId）に持たせ、同じ発言を二重に載せない。
+  写した行が新しい会話の ID を持つ分岐では、写した部分の印（fork_briefing）、前に元と決めた要約、共有しない発言の早さ、
+  会話の ID の順で元を決める。分岐元は、受け継いだ発言のうち最後のものの持ち主。
 - 要約のファイル records/sessions/<開始日>_<ID の先頭 8 文字>.md（git で管理）を用意する。
   - 無ければ、ひな形（中身は「要約待ち」）を作る。名前は作るときに決め、後から変えない（リンクを切らないため）。
   - あれば、冒頭の <!-- auto:start --> 〜 <!-- auto:end --> の間（会話の ID、期間、生の記録への参照、ハブのコミット）だけを書き直す。
@@ -59,7 +61,7 @@ LOCK = (HUB / ".git" / "hub-scripts.lock") if (HUB / ".git").is_dir() else (HUB 
 # これより古いロックは、止められた実行が残したものとして外す。会話の終わりのフックは 60 秒ほどで止められ、
 # 手で動かした長い実行は 20 秒ごとにロックの時刻を新しくする（keep_lock）ので、これより古いものは確かに止まっている
 STALE_SEC = 90
-CACHE_VERSION = 5  # 読み方を変えたら上げる。上がると、すべての会話を一度読み直す
+CACHE_VERSION = 6  # 読み方を変えたら上げる。上がると、すべての会話を一度読み直す
 CACHE_SAVE_EVERY, CACHE_SAVE_SEC = 25, 10  # 読み直した会話がこの数になるか、この秒数がたつごとに、途中までを控えに書く
 TEMP_RX = re.compile(r"^\.t(?:[0-9a-f]{2}|[0-9a-f]{8})\.tmp$")  # make_temp の名前
 TEMP_STALE_SEC = 600  # これより古い一時ファイルは、止められた実行が残したもの
@@ -71,6 +73,10 @@ SKIP_PREFIXES = (
     "<system-reminder", "<local-command", "<side-sessions", "<task-notification",
     "[Request interrupted", "<ci-monitor-event", "<user-prompt-submit-hook",
 )
+# Claude Code がスラッシュコマンドの発言に書く印。いまの版は <command-name> から始め、<command-message>、<command-args> と続く
+COMMAND_TAGS = ("<command-name>", "<command-message>", "<command-args>")
+# 指示書から始めた作業の会話の、起動の文（「<hub>/hub/briefs/<id>.md を読んで…」）の作業の id
+BRIEF_RX = re.compile(r"hub[/\\]briefs[/\\]([^/\\\s`'\"<>|]+?)\.md")
 CHORE_RX = re.compile(r"^chore\((sessions|links)\)!?:")
 SECRET_MARK = "<秘密の値>"
 # 鍵の前後は英数字で区切る（\b は日本語も字に数えるので、「キーはghp_…」の鍵を見落とす）。中身も英数字と記号だけにする
@@ -84,8 +90,12 @@ PEM_END_RX = re.compile(r"-----END (?:[A-Z0-9]+ ){0,4}PRIVATE KEY-----")
 PEM_BODY_RX = re.compile(r"(?:[ \t]*(?:(?:\r\n?|\n)[ \t]*)?[A-Za-z0-9+/=]{16,})*")
 PEM_MAX = 16384  # 始まりの行から、終わりの行までの長さの上限
 SECRET = [
-    # 英数字だけで、前半は 64 字まで（日本語は \w に入るので、長い日本語の並びを読みに行かないように）
-    (re.compile(r"(?<![A-Za-z0-9._%+-])[A-Za-z0-9._%+-]{1,64}@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+"), "<メールアドレス>"),
+    # 英数字だけで、前半は 64 字まで（日本語は \w に入るので、長い日本語の並びを読みに行かないように）。
+    # 最後の区切り（.com など）に英字が要る（「com.example.pkg@69.0.0」のような、名前と版の組を伏せないように）。
+    # 後ろに「:」とパスの字が続くもの（「git@github.com:lab/x.git」）は、git の URL なので伏せない。
+    # 後ろに区切りの字が続くとき、短く切って当てないように、後ろが英数字・「.英数字」でないことも確かめる
+    (re.compile(r"(?<![A-Za-z0-9._%+-])[A-Za-z0-9._%+-]{1,64}@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*"
+                r"\.(?=[A-Za-z0-9-]*[A-Za-z])[A-Za-z0-9-]+(?![A-Za-z0-9-]|\.[A-Za-z0-9-]|:[A-Za-z0-9_./~-])"), "<メールアドレス>"),
     # JSON Web Token（eyJ で始まる、base64url の 3 つの部分）
     (re.compile(_NB + r"eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}"), SECRET_MARK),
     # 「sk-」と Slack は、数字を含むものだけ（「xoxo-hugs-and-kisses」のような、ふつうの言葉の並びを伏せないように）
@@ -286,11 +296,13 @@ def user_text(content):
     種類は user（研究者の発言）か command（引数の無いスラッシュコマンド）。
     引数のあるコマンド（「/harness-dispatch 実装を進めたい」）は研究者の発言として user にする。
     引数の無いコマンドは読める形に残すが、研究者が話したかどうか（記録の対象か、要約が要るか）の判定には入れない
-    （/exit や /clear で数えないため）。"""
+    （/exit や /clear で数えないため）。
+    スラッシュコマンドとみなすのは、Claude Code が書く印（COMMAND_TAGS）で始まる発言だけ（印を本文に貼った発言を、
+    コマンドとして読んで本文を失わないため）。"""
     t = strip_reminders(message_text(content)).strip()
     if not t:
         return "", None
-    if "<command-name>" in t:
+    if t.startswith(COMMAND_TAGS):
         name, args = tag_text(t, "command-name"), tag_text(t, "command-args")
         text = " ".join(x.strip() for x in (name, args) if x and x.strip())
         return text, ("user" if args and args.strip() else "command")
@@ -332,6 +344,48 @@ def tool_result_text(c):
     return str(c or "")
 
 
+def drop_queued_twins(items):
+    """作業中に送った発言（queued）は、あとで普通に打った発言としても記録されることがある。
+    同じ会話（label）で、同じ本文（空白をそろえる）の普通の発言が、その時刻から 10 分以内に後に続けば、作業中に送った方を除く。
+    一つの普通の発言で除けるのは、作業中に送った発言の一つだけ（続けて送った「はい」を、まとめて消さないため）。
+    前にある普通の発言では除かない（同じ本文を、普通に打ってから作業中にもう一度送ったときに、二つ目を消さないため）。
+    時刻の読めない発言は除かない。"""
+    typed = {}
+    for i in items:
+        if i["kind"] in ("user", "command") and not i.get("queued"):
+            t = local(i["ts"])
+            if t is not None:
+                typed.setdefault((i["label"], re.sub(r"\s+", " ", i["text"]).strip()), []).append(t)
+    if not typed:
+        return items
+    for v in typed.values():
+        v.sort()
+    queued = [(local(i["ts"]), k) for k, i in enumerate(items) if i.get("queued")]
+    used, drop = set(), set()
+    # 時刻の順に、まだ使っていない、いちばん早い普通の発言と組にする（同じ長さの窓なので、これで組がいちばん多くなる）
+    for t0, k in sorted((x for x in queued if x[0] is not None), key=lambda x: (x[0], x[1])):
+        i = items[k]
+        key = (i["label"], re.sub(r"\s+", " ", i["text"]).strip())
+        for n, x in enumerate(typed.get(key, [])):
+            d = (x - t0).total_seconds()
+            if d >= 600:
+                break
+            if d >= 0 and (key, n) not in used:
+                used.add((key, n))
+                drop.add(k)
+                break
+    return [i for k, i in enumerate(items) if k not in drop]
+
+
+def fallback_title(text: str) -> str:
+    """題（customTitle も aiTitle も）が無いときの題。指示書から始めた作業の会話（起動の文に hub/briefs/<id>.md がある）は、
+    作業の id から作る（どの作業の会話も、起動の文の同じパスの頭になるため）。そうでなければ、最初の発言の頭の 40 字。"""
+    m = BRIEF_RX.search(text)
+    if m:
+        return one_line(redact(f"作業 {m.group(1)}" + ("（続き）" if "続きから" in text else "")), 80)
+    return one_line(redact(text), 40)
+
+
 def parse(path: Path):
     """会話を、発言の並び（uuid、種類、時刻、本文）に直す。"""
     sid, cwd, title_c, title_a = path.stem, None, None, None
@@ -366,6 +420,13 @@ def parse(path: Path):
                 origin = o.get("kind") if isinstance(o, dict) else None
                 if not isinstance(a.get("timestamp"), str):
                     a["timestamp"] = None
+                if a.get("type") == "fork_briefing":
+                    # 分岐して作った会話に、Claude Code が写した部分の後ろに置く行。ここより前の発言は分岐元から写したもの
+                    # （持ち主を決めるときに、この会話を持ち主にしない。写した行が新しい会話の ID を持つ分岐でも、元が分かる）
+                    for it in items:
+                        it["inh"] = True
+                    cur = None
+                    continue
                 if (a.get("type") == "queued_command" and a.get("commandMode") == "prompt"
                         and not a.get("isMeta") and origin in (None, "human")):
                     t, kind = user_text(a.get("prompt"))
@@ -421,22 +482,10 @@ def parse(path: Path):
         if it["kind"] == "claude":
             it["text"] = "\n\n".join(it["text"])
     items = [it for it in items if it["kind"] != "claude" or it["text"] or it["tools"]]
-    # 作業中に送った発言は、あとで普通の発言としても記録されることがある。
-    # 同じ会話（label）で、前後 10 分以内に同じ本文の普通の発言があれば、普通の発言の方を残す
-    said = {}
-    for i in items:
-        if i["kind"] in ("user", "command") and not i.get("queued"):
-            said.setdefault((i["label"], re.sub(r"\s+", " ", i["text"]).strip()), []).append(local(i["ts"]))
-
-    def dup(i):
-        if not i.get("queued"):
-            return False
-        t0 = local(i["ts"])
-        others = said.get((i["label"], re.sub(r"\s+", " ", i["text"]).strip()), [])
-        return any(t0 is None or x is None or abs((x - t0).total_seconds()) < 600 for x in others)
-    items = [i for i in items if not dup(i)]
+    items = drop_queued_twins(items)
     # 題は、伏せてから 40 字で切る（切ってから伏せると、途中で切れたメールアドレスや鍵が、要約の題と一覧に残るため）
-    title = redact(title_c or title_a or next((one_line(redact(i["text"]), 40) for i in items if i["kind"] == "user"), sid[:8]))
+    first_user = next((i["text"] for i in items if i["kind"] == "user"), None)
+    title = redact(title_c or title_a or (fallback_title(first_user) if first_user else sid[:8]))
     times = [local(i.get("te") or i["ts"]) for i in items]
     first = next((local(i["ts"]) for i in items if local(i["ts"])), None)
     last = max((t for t in times if t), default=None)
@@ -1155,7 +1204,9 @@ def main():
         entry = {"key": key, "title": p["title"], "cwd": p["cwd"],
                  "uuids": [i["uuid"] for i in p["items"]], "labels": [i["label"] for i in p["items"]],
                  "kinds": [i["kind"] for i in p["items"]], "ts": [i["ts"] for i in p["items"]],
-                 "te": [i.get("te") or i["ts"] for i in p["items"]], "changed": True}
+                 "te": [i.get("te") or i["ts"] for i in p["items"]],
+                 # 分岐元から写した、頭の発言の数（Claude Code が写した部分の後ろに置く行（fork_briefing）より前）
+                 "inh": sum(1 for i in p["items"] if i.get("inh")), "changed": True}
         cache[sid] = entry
         return {"id": sid, "path": f, "parsed": p, **entry}
 
@@ -1210,19 +1261,6 @@ def main():
             for x in lone:
                 print(f"  ! {x}")
 
-    # 各発言の持ち主：発言に記された会話がその発言を持っていればその会話、無ければ最も早い会話
-    def first_ts(s):
-        return min((x for x in s["ts"] if x), default="")
-    sessions.sort(key=lambda s: (first_ts(s), s["id"]))  # 時刻が同じなら会話の ID の順（読み元によって入れ替わらないように）
-    holders = {}
-    for s in sessions:
-        for u, lab in zip(s["uuids"], s["labels"]):
-            holders.setdefault(u, []).append((s["id"], lab))
-    owner = {}
-    for u, hs in holders.items():
-        ids = [h[0] for h in hs]
-        owner[u] = hs[0][1] if hs[0][1] in ids else ids[0]
-
     # 要約のファイルの名前は、作るときに決めて変えない。あれば（*_<ID の先頭 8 文字>.md）その名前を使い続ける。
     # 開始日は時間帯や分岐元が分かったことで変わりうるが、名前を変えるとリンクが切れるため
     existing = {}
@@ -1230,6 +1268,61 @@ def main():
         n = p.name
         if len(n) > 12 and n[-12] == "_":
             existing.setdefault(n[-11:-3], []).append(n)
+
+    def first_ts(s):
+        return min((x for x in s["ts"] if x), default="")
+    sessions.sort(key=lambda s: (first_ts(s), s["id"]))  # 時刻が同じなら会話の ID の順（読み元によって入れ替わらないように）
+    holders = {}
+    for s in sessions:
+        for u, lab in zip(s["uuids"], s["labels"]):
+            holders.setdefault(u, []).append((s["id"], lab))
+    by_id = {s["id"]: s for s in sessions}
+    start_of = {s["id"]: first_ts(s) for s in sessions}
+    held = {u: {h[0] for h in hs} for u, hs in holders.items() if len(hs) > 1}  # 二つ以上の会話が持つ発言
+    inherited = {s["id"]: set(s["uuids"][: s.get("inh") or 0]) for s in sessions}
+    plain_memo, outside_memo = {}, {}
+
+    def plain_summary(sid):
+        """この会話の要約のファイルが、もうあり、冒頭の囲みに「分岐元」の行が無いか（前に元の会話と決めた。決め直して
+        入れ替えないため）。囲みの「会話の ID」がこの会話のものだけを見る。"""
+        if sid not in plain_memo:
+            plain_memo[sid] = False
+            for n in sorted(existing.get(sid[:8], [])):
+                t = read_or_none(OUT / n)
+                b = find_auto(t) if t is not None else None
+                if isinstance(b, tuple):
+                    blk = t[b[0]:b[1]]
+                    if sid in AUTO_ID_RX.findall(blk) and not re.search(r"^- 分岐元：", blk, re.M):
+                        plain_memo[sid] = True
+                        break
+        return plain_memo[sid]
+
+    def first_outside(sid, hset):
+        """会話の発言のうち、hset のほかの会話が持たない発言の、最も早い時刻（無ければ、どの時刻より後の字）。"""
+        k = (sid, hset)
+        if k not in outside_memo:
+            s, others_ = by_id[sid], hset - {sid}
+            outside_memo[k] = min((t for u, t in zip(s["uuids"], s["ts"])
+                                   if t and (u not in held or held[u].isdisjoint(others_))), default=chr(0xFFFF))
+        return outside_memo[k]
+
+    # 各発言の持ち主。二つ以上の会話が持つ発言（分岐）は、次の順で決める：
+    # 1. 写した部分の印（fork_briefing）より前にある会話は、持ち主にしない（ほかに持つ会話があれば）
+    # 2. 発言の行に記された会話（sessionId）が、ほかの持つ会話なら、その会話（写した行が元の会話の ID を持つ分岐）
+    # 3. 最も早く始まった会話。同じ時刻なら、冒頭の囲みに「分岐元」の無い要約がもうある会話（前に元と決めた）、
+    #    次に、共有しない発言が最も早い会話、最後に会話の ID の順（どの PC でも同じに決まるように）
+    owner = {}
+    for u, hs in holders.items():
+        if len(hs) == 1:
+            owner[u] = hs[0][0]
+            continue
+        hset = frozenset(held[u])
+        cands = [h for h in hs if u not in inherited[h[0]]] or hs
+        cids = {h[0] for h in cands}
+        order = sorted(cands, key=lambda h: (start_of[h[0]], not plain_summary(h[0]),
+                                             first_outside(h[0], hset), h[0]))
+        claimed_by = [h[1] for h in order if h[1] != h[0] and h[1] in cids]
+        owner[u] = claimed_by[0] if claimed_by else order[0][0]
     claimed = set()  # この実行で、どれかの会話が使うと決めた要約のファイル
     claimed8 = {}  # ID の先頭 8 文字 -> この実行で、その先頭 8 文字の会話に最初に決めた要約のファイル
 
@@ -1271,12 +1364,14 @@ def main():
         first = readable(ts_own)
         last = readable(reversed(te_own))
         s["own_idx"] = own
-        file, clash = pick_file(s, first)
+        # 新しく要約のファイルを作るのは、自分の発言（研究者の発言か選択肢の回答）があるときだけ（引数の無いコマンドと
+        # Claude の返答だけの分岐は、記録の対象の判定と同じに、自分の発言なしとする）。もうあるファイルは使い続ける
+        file, clash = pick_file(s, first if talk_own else None)
         if file:
             claimed.add(file)
             claimed8.setdefault(s["id"][:8], file)
         rows[s["id"]] = {"id": s["id"], "title": s.get("title", ""), "first": first, "last": last,
-                         "last_talk": readable(reversed(talk_own)),
+                         "last_talk": readable(reversed(talk_own)), "talk": bool(talk_own),
                          "cwd": s.get("cwd"), "n_own": len(own), "file": file, "clash": clash}
 
     if a.list:
@@ -1294,15 +1389,14 @@ def main():
         keep_lock()
         maybe_save_cache()  # 前の会話の読める形と要約を書いたところで
         r = rows[s["id"]]
-        others = {}
-        for u in s["uuids"]:
+        # 分岐元は、受け継いだ発言のうち最後のものの持ち主（分岐を作った会話。分岐の分岐では、その前の分岐）。
+        # 要約のファイルのある会話だけを数える
+        parent = None
+        for u in reversed(s["uuids"]):
             o = owner.get(u)
             if o and o != s["id"] and rows[o]["file"]:
-                others[o] = others.get(o, 0) + 1
-        parent = None
-        if others:
-            pid = max(others, key=others.get)
-            parent = {"title": rows[pid]["title"], "file": rows[pid]["file"]}
+                parent = {"title": rows[o]["title"], "file": rows[o]["file"]}
+                break
         r["parent"] = parent
         if not r["file"]:
             cache[s["id"]].pop("changed", None)
@@ -1366,9 +1460,9 @@ def main():
         until = summarized_until(new)
         r["until"] = until
         # 要約が要るのは、要約した範囲の後に研究者の発言があるとき（Claude の最後の返答だけでは要らない）。
-        # 自分の発言が無い会話（中身はすべて分岐元にある）は要らない
+        # 自分の発言（研究者の発言か選択肢の回答）が無い会話は要らない（中身はすべて分岐元にある、引数の無いコマンドだけ）
         lt = r["last_talk"]
-        r["pending"] = r["n_own"] > 0 and ((until is None) or (lt is not None and f"{lt:%Y-%m-%d %H:%M}" > until))
+        r["pending"] = r["talk"] and ((until is None) or (lt is not None and f"{lt:%Y-%m-%d %H:%M}" > until))
         cache[s["id"]].pop("changed", None)
 
     rows_l = [rows[s["id"]] for s in sessions]

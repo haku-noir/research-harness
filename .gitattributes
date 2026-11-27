@@ -6,6 +6,9 @@ harness/hooks/* text eol=lf
 *.py text eol=lf
 *.txt text eol=lf
 *.json text eol=lf
+# git の設定のファイルも LF にする（.gitignore が CRLF で取り出されると、空行の「\r」が「/」で終わるパスに当たる形になるため）
+.gitignore text eol=lf
+.gitattributes text eol=lf
 # 毎回すべてを作り直す一覧は、マージで両方の行を残す（次の実行で作り直されるので、ぶつからないようにする）
 records/sessions/README.md merge=union
 records/links.md merge=union

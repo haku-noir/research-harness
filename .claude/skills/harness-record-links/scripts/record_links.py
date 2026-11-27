@@ -32,6 +32,11 @@
 - リンクの先は、最初の「#」で印と分けてから、それぞれの %xx を戻す（名前の「#」は %23 と書く）。
   このスクリプトが書くリンクでは、名前の「%」と「#」を %25、%23 にする
 - ひな形の書きかけ（1 行の {{…}}）の中は、記録の名前もリンクも探さない
+- コードの外の HTML の注釈（<!-- 〜 -->）の中も、記録の名前もリンクも探さない（ひな形の注釈に書いた例のため）。
+  囲みの印の行（links:start など）は、注釈を除く前に探すので、これまでどおり働く
+- リンクにせずに書いた記録のパス（records/sessions/… など。前に「../」「./」が付いてもよい）は、ハブからたどり、無ければ出す
+- git に入れない場所かは、git check-ignore で当たった形で決める。空の形（CRLF の .gitignore の空行）と「!」で始まる形に
+  当たっただけのパスは、git に入れない場所とみなさない
 
 書けなかったファイル（読み取り専用、パスが長すぎるなど）は飛ばしてほかを続け、手で動かしたときと records/links.md に出す。
 中身が変わらないファイルは書き直さない。
@@ -71,7 +76,12 @@ ANCHOR_ID_RX = re.compile(r"^[a-z]{1,3}-\d{8}-\d{6}(?:-\d+)?$")
 # <…> の中には「<」を含めない（閉じていない「](<」が長い行に並んでも、それぞれから行の終わりまで読み直さないため）
 LINK_RX = re.compile(r"\]\((<[^<>\n]+>|(?:[^()\s]|\([^()\s]*\))+)\)")
 TAIL_RX = re.compile(r"(?:/README\.md)?(?:#([A-Za-z0-9_-]+))?")  # 印は英数字だけ（後ろに続く日本語を印に含めない）
-BARE_RX = re.compile(r"(?<![\w/.-])records/(?:sessions|meetings|experiments|history)/[^\s`)>|、。<>\[\]*…{}]+")
+# リンクにせずに書いた記録のパス。前に「../」「./」がいくつ付いてもよい（hub/decisions.md の「会話：../records/sessions/…」）。
+# あるかどうかは、付いた「../」によらず、ハブから確かめる
+BARE_RX = re.compile(r"(?<![\w/.-])(?:\.\.?/)*records/(?:sessions|meetings|experiments|history)/[^\s`)>|、。<>\[\]*…{}]+")
+BARE_LEAD_RX = re.compile(r"^(?:\.\.?/)+")
+# HTML の注釈（<!-- 〜 -->）。中に書いた例（ひな形の「例：exp-pilot」など）を、記録の名前やリンクとして読まないため
+COMMENT_OPEN, COMMENT_CLOSE = "<!--", "-->"
 FENCE_RX = re.compile(r"^(```|~~~).*?^\1[^\n]*$", re.S | re.M)
 INLINE_CODE_RX = re.compile(r"`[^`\n]*`")
 unreadable = []  # UTF-8 で読めなかった、または開けなかったファイル
@@ -112,6 +122,28 @@ def mask_code(text: str) -> str:
     """コードの中（``` の囲みと `…`）を、同じ長さの空白に置き換える（位置を保ったまま、コードの中を探さないため）。"""
     t = FENCE_RX.sub(lambda m: re.sub(r"[^\n]", " ", m.group(0)), text)
     return INLINE_CODE_RX.sub(lambda m: " " * len(m.group(0)), t)
+
+
+def mask_comments(text: str) -> str:
+    """コードの外の HTML の注釈（<!-- 〜 -->。複数の行にまたがってもよい）を、改行を残して空白に置き換える
+    （行と位置を保ったまま、注釈の中を探さないため）。閉じていない「<!--」は注釈とみなさない（本文を読み落とさないため）。
+    コードの中の「<!--」「-->」は数えない。str.find で探す（閉じていない「<!--」が多く並んでも、読み直さないため）。"""
+    if COMMENT_OPEN not in text:
+        return text
+    m = mask_code(text)
+    out, pos = [], 0
+    while True:
+        i = m.find(COMMENT_OPEN, pos)
+        if i == -1:
+            break
+        j = m.find(COMMENT_CLOSE, i + len(COMMENT_OPEN))
+        if j == -1:
+            break  # 閉じていない（後ろの「<!--」も閉じていない）
+        j += len(COMMENT_CLOSE)
+        out += [text[pos:i], re.sub(r"[^\n]", " ", text[i:j])]
+        pos = j
+    out.append(text[pos:])
+    return "".join(out)
 
 
 # このスクリプトが囲みの中に書く行の形（「- 相談：…」など）
@@ -427,12 +459,21 @@ def ignored_by_git(paths):
     # フォルダだけに当たる形（data/ など）は、無いパスには「/」を付けないと当たらない。両方で聞き、どちらかで当たれば外とする
     query = [y for x in rels for y in (x, x + "/")]
     try:
-        # NUL で区切った bytes で渡す（文字列で渡すと、Windows では改行が CRLF に変わり、パスの末尾に \r が付くため）
-        r = subprocess.run(["git", "-C", str(HUB), "check-ignore", "--no-index", "--stdin", "-z"],
+        # NUL で区切った bytes で渡す（文字列で渡すと、Windows では改行が CRLF に変わり、パスの末尾に \r が付くため）。
+        # -v で、当たった形も受け取る（出力は「ファイル、行、形、パス」の四つずつを NUL で区切ったもの）
+        r = subprocess.run(["git", "-C", str(HUB), "check-ignore", "--no-index", "--stdin", "-z", "-v"],
                            input=b"\0".join(x.encode("utf-8", "replace") for x in query) + b"\0", capture_output=True, timeout=30)
-        return {x.decode("utf-8", "replace").rstrip("/") for x in r.stdout.split(b"\0") if x}
     except (OSError, subprocess.SubprocessError):
         return set()
+    parts = r.stdout.split(b"\0")
+    out = set()
+    for i in range(0, len(parts) - 3, 4):
+        pattern = parts[i + 2].decode("utf-8", "replace").strip()  # 空白と「\r」を除く
+        # 空の形は数えない（.gitignore が CRLF で取り出されると、空行の「\r」が、「/」で終わるすべてのパスに当たる形になるため）。
+        # 「!」で始まる形は、外さない形（-v では、それに当たったパスも出る）
+        if pattern and not pattern.startswith("!"):
+            out.add(parts[i + 3].decode("utf-8", "replace").rstrip("/"))
+    return out
 
 
 def auto_region(lines):
@@ -845,7 +886,7 @@ def main():
             for m in BARE_RX.finditer(fence_free):
                 if m.start() > 0 and fence_free[m.start() - 1] in "(<":
                     continue  # リンクの先は、上で確かめた
-                path = m.group(0).split("#")[0]
+                path = BARE_LEAD_RX.sub("", m.group(0).split("#")[0])  # 前の「../」「./」は外して、ハブから確かめる
                 k = path.find(".md")
                 path = (path[:k + 3] if k != -1 else path).rstrip("/")
                 if skip_target(path):
@@ -858,12 +899,16 @@ def main():
         lines_t = text.split("\n")
         quiet = set()
         if nodes[src]["kind"] == "会話":
+            # 囲みの印（それ自体が注釈の形）は、注釈を空白にする前の行で探す
             region = auto_region(lines_t)
             if region:
                 quiet.update(range(region[0], region[1] + 1))
             first = next((i for i, x in enumerate(lines_t) if x.strip()), None)
             if first is not None and lines_t[first].startswith("# 会話の要約："):
                 quiet.add(first)
+        # HTML の注釈の中は、名前もリンクも探さない（行の数は変わらないので、上の行の番号はそのまま使える）
+        text = mask_comments(text)
+        lines_t = text.split("\n")
         if quiet:
             loud_t = "\n".join("" if i in quiet else x for i, x in enumerate(lines_t))
             quiet_t = "\n".join(x if i in quiet else "" for i, x in enumerate(lines_t))
