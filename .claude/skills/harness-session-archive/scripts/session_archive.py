@@ -4,12 +4,10 @@
 - 要約するための読める形を records/sessions/raw/digest/<会話の ID>.md に書く（git の外）。
   研究者の発言・Claude の返答の本文・道具の呼び出しの 1 行・選択肢での質問と回答を、時刻と uuid つきで載せる。
   ほかの会話・アプリが送った発言（turnOrigin で見分ける）は、そうと分かる見出しで載せ、研究者の発言には数えない。
-  分岐した会話は、各発言を、それを最初に書いた会話に持たせ、同じ発言を二重に載せない。
-  写した部分の印（fork_briefing）より前の発言は持ち主にしない。ほかは、自分の返答の途中の行として持つ会話、
-  前の発言が多い会話（写した部分は、ファイルの頭にまとめて置かれる）、早く始まった会話、前に元と決めた要約、
-  共有しない発言の早さ、会話の ID の順に並べ、行の sessionId が自分の ID の会話のうち最初のものを持ち主にする
-  （無ければ、行の sessionId が指す会話、それも無ければ並びの最初）。分岐元は、受け継いだ発言のうち最後のものの持ち主
-  （分岐元が輪にならないようにする）。
+  分岐・続きの会話は、各行を、それを最初に書いた会話に持たせ、同じ行を二重に載せない。
+  各ファイルの頭の、ほかの会話から写した部分（copied_block）を、ファイルの形だけから決め、行の持ち主は、その行を
+  写した部分の外に持つ会話とする。分岐元は、写した部分の最後の行の持ち主。持ち主がいま無い行は、持つ会話のうち
+  元に最も近いものが載せる（ownership）。
 - 要約のファイル records/sessions/<開始日>_<ID の先頭 8 文字>.md（git で管理）を用意する。
   - 無ければ、ひな形（中身は「要約待ち」）を作る。名前は作るときに決め、後から変えない（リンクを切らないため）。
   - あれば、冒頭の <!-- auto:start --> 〜 <!-- auto:end --> の間（会話の ID、期間、生の記録への参照、ハブのコミット）だけを書き直す。
@@ -65,7 +63,7 @@ LOCK = (HUB / ".git" / "hub-scripts.lock") if (HUB / ".git").is_dir() else (HUB 
 # これより古いロックは、止められた実行が残したものとして外す。会話の終わりのフックは 60 秒ほどで止められ、
 # 手で動かした長い実行は 20 秒ごとにロックの時刻を新しくする（keep_lock）ので、これより古いものは確かに止まっている
 STALE_SEC = 90
-CACHE_VERSION = 7  # 読み方を変えたら上げる。上がると、すべての会話を一度読み直す
+CACHE_VERSION = 8  # 読み方を変えたら上げる。上がると、すべての会話を一度読み直す
 CACHE_SAVE_EVERY, CACHE_SAVE_SEC = 25, 10  # 読み直した会話がこの数になるか、この秒数がたつごとに、途中までを控えに書く
 TEMP_RX = re.compile(r"^\.t(?:[0-9a-f]{2}|[0-9a-f]{8})\.tmp$")  # make_temp の名前
 TEMP_STALE_SEC = 600  # これより古い一時ファイルは、止められた実行が残したもの
@@ -408,9 +406,10 @@ def parse(path: Path):
     """会話を、発言の並び（uuid、種類、時刻、本文）に直す。"""
     sid, cwd, title_c, title_a = path.stem, None, None, None
     items, ask_ids = [], {}
+    raw, nou = [], None  # uuid のある行の (uuid, 行の会話の ID, 時刻, 印)、uuid の無い行の最初の時刻
     cur = None  # 続いている Claude の返答
     with open(path, encoding="utf-8", errors="replace") as fh:
-        for line in fh:
+        for n_line, line in enumerate(fh):
             try:
                 d = json.loads(line)
             except (json.JSONDecodeError, RecursionError):
@@ -430,6 +429,16 @@ def parse(path: Path):
                 d["uuid"] = None
             if not isinstance(d.get("sessionId"), str):
                 d["sessionId"] = None
+            ri = None  # この行の、uuid のある行の並び（raw）での位置
+            if not d.get("isSidechain"):
+                if d["uuid"]:
+                    a = d.get("attachment")
+                    mark = ("fb" if typ == "attachment" and isinstance(a, dict) and a.get("type") == "fork_briefing" else
+                            "cb" if typ == "system" and d.get("subtype") == "compact_boundary" else None)
+                    ri = len(raw)
+                    raw.append((d["uuid"], d["sessionId"] or sid, d["timestamp"], mark))
+                elif d["timestamp"] and nou is None:
+                    nou = d["timestamp"]  # uuid の無い、時刻のある最初の行（続きでは、続きを始めた時刻）
             if typ == "attachment" and not d.get("isSidechain"):
                 # Claude が作業している間に研究者が送った発言。ほかの会話（peer）や作業の知らせは除く
                 a = d.get("attachment")
@@ -439,10 +448,7 @@ def parse(path: Path):
                 if not isinstance(a.get("timestamp"), str):
                     a["timestamp"] = None
                 if a.get("type") == "fork_briefing":
-                    # 分岐して作った会話に、Claude Code が写した部分の後ろに置く行。ここより前の発言は分岐元から写したもの
-                    # （持ち主を決めるときに、この会話を持ち主にしない。写した行が新しい会話の ID を持つ分岐でも、元が分かる）
-                    for it in items:
-                        it["inh"] = True
+                    # 分岐して作った会話に、Claude Code が写した部分の後ろに置く行（写した部分は copied_block で決める）
                     cur = None
                     continue
                 if (a.get("type") == "queued_command" and a.get("commandMode") == "prompt"
@@ -450,7 +456,7 @@ def parse(path: Path):
                     t, kind = user_text(a.get("prompt"))
                     if t:
                         items.append({"uuid": d.get("uuid"), "label": d.get("sessionId") or sid, "kind": kind,
-                                      "ts": d.get("timestamp") or a.get("timestamp"), "text": t, "queued": True})
+                                      "ts": d.get("timestamp") or a.get("timestamp"), "text": t, "queued": True, "ri": [ri]})
                         cur = None
                 continue
             if d.get("isSidechain") or typ not in ("user", "assistant"):
@@ -460,7 +466,8 @@ def parse(path: Path):
             content = msg.get("content") if isinstance(msg, dict) else None
             if typ == "user":
                 if d.get("isCompactSummary"):
-                    items.append({"uuid": uuid, "label": label, "kind": "note", "ts": ts, "text": "（ここで会話が要約され、続きの会話になった）"})
+                    items.append({"uuid": uuid, "label": label, "kind": "note", "ts": ts, "ri": [ri],
+                                  "text": "（ここで会話が要約され、続きの会話になった）"})
                     cur = None
                     continue
                 if d.get("isMeta"):
@@ -470,18 +477,18 @@ def parse(path: Path):
                         if isinstance(x, dict) and x.get("type") == "tool_result" and x.get("tool_use_id") in ask_ids:
                             if x.get("is_error") is True:
                                 # 質問が取り消された・断られた（研究者の回答ではない）
-                                items.append({"uuid": f"{uuid}-a", "label": label, "kind": "cancelled", "ts": ts,
+                                items.append({"uuid": f"{uuid}-a", "label": label, "kind": "cancelled", "ts": ts, "ri": [ri],
                                               "text": ask_ids[x["tool_use_id"]] + "\n- 質問は取り消された"})
                             else:
                                 ans = tool_result_text(x.get("content"))
-                                items.append({"uuid": f"{uuid}-a", "label": label, "kind": "answer", "ts": ts,
+                                items.append({"uuid": f"{uuid}-a", "label": label, "kind": "answer", "ts": ts, "ri": [ri],
                                               "text": ask_ids[x["tool_use_id"]] + "\n- 研究者の回答：" + one_line(redact(ans), 2000)})
                             cur = None
                 t, kind = user_text(content)
                 if t and not t.startswith("This session is being continued"):
                     if kind == "user" and not_typed(d):
                         kind = "sent"  # ほかの会話・アプリが送った発言（研究者の発言には数えない）
-                    items.append({"uuid": uuid, "label": label, "kind": kind, "ts": ts, "text": t})
+                    items.append({"uuid": uuid, "label": label, "kind": kind, "ts": ts, "text": t, "ri": [ri]})
                     cur = None
             else:
                 if not isinstance(content, list):
@@ -493,26 +500,26 @@ def parse(path: Path):
                         ask_ids[b.get("id")] = ask_text(b.get("input", {}) or {})
                     if b.get("type") not in ("text", "tool_use"):
                         continue
-                    # 続いている返答と行の会話の ID が違う（分岐で写した返答の後ろに、分岐の自分の返答が続いた）か、
-                    # 続いている返答が写したもので、この行が自分のものなら、別の返答にする（自分の返答を、写した返答に混ぜないため）
-                    if cur is not None and (cur["label"] != label or (cur.get("inh") and label == sid)):
+                    # 続いている返答と行の会話の ID が違う（分岐で写した返答の後ろに、分岐の自分の返答が続いた）なら、別の返答にする
+                    if cur is not None and cur["label"] != label:
                         cur = None
                     if cur is None:
-                        cur = {"uuid": uuid, "label": label, "kind": "claude", "ts": ts, "text": [], "tools": [], "members": []}
+                        cur = {"uuid": uuid, "label": label, "kind": "claude", "ts": ts, "parts": []}
                         items.append(cur)
-                    if uuid and cur["members"][-1:] != [uuid]:
-                        cur["members"].append(uuid)  # まとめた行の uuid（分岐で写した返答の途中から始まる写しの持ち主を決めるため）
                     cur["te"] = ts or cur.get("te")  # 返答が続いた最後の時刻（期間と、要約が要るかの判定に使う）
-                    if b["type"] == "text" and isinstance(b.get("text"), str) and b["text"].strip():
-                        cur["text"].append(b["text"].strip())
-                    elif b["type"] == "tool_use":
-                        s = tool_summary(b)
-                        if s:
-                            cur["tools"].append(s)
+                    text = b["text"].strip() if b["type"] == "text" and isinstance(b.get("text"), str) else ""
+                    tool = tool_summary(b) if b["type"] == "tool_use" else None
+                    if text or tool:
+                        # まとめた返答の、行ごとの部分（載せるものがある行だけ）。行ごとに持ち主を決めるため
+                        if not cur["parts"] or cur["parts"][-1]["n"] != n_line:
+                            cur["parts"].append({"n": n_line, "i": ri, "u": uuid, "ts": ts, "text": [], "tools": []})
+                        cur["parts"][-1]["text" if text else "tools"].append(text or tool)
+    items = [it for it in items if it["kind"] != "claude" or it["parts"]]
     for it in items:
         if it["kind"] == "claude":
-            it["text"] = "\n\n".join(it["text"])
-    items = [it for it in items if it["kind"] != "claude" or it["text"] or it["tools"]]
+            it["ri"] = [p["i"] for p in it["parts"]]
+            it["text"] = "\n\n".join(x for p in it["parts"] for x in p["text"])
+            it["tools"] = [x for p in it["parts"] for x in p["tools"]]
     items = drop_queued_twins(items)
     # 題は、伏せてから 40 字で切る（切ってから伏せると、途中で切れたメールアドレスや鍵が、要約の題と一覧に残るため）
     first_user = next((i["text"] for i in items if i["kind"] in ("user", "sent")), None)
@@ -520,7 +527,173 @@ def parse(path: Path):
     times = [local(i.get("te") or i["ts"]) for i in items]
     first = next((local(i["ts"]) for i in items if local(i["ts"])), None)
     last = max((t for t in times if t), default=None)
-    return {"id": sid, "cwd": cwd, "title": title, "items": items, "first": first, "last": last}
+    blk = copied_block(raw, sid, nou)
+    return {"id": sid, "cwd": cwd, "title": title, "items": items, "first": first, "last": last,
+            "raw": [r[0] for r in raw], "blk": blk,
+            # 写した部分の後ろで、行の会話の ID がほかの会話のもの（持ち主が決まらないときに、後回しにする）
+            "fl": [k for k in range(blk, len(raw)) if raw[k][1] != sid]}
+
+
+def _instant(ts):
+    try:
+        t = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+        return t if t.tzinfo else t.astimezone()
+    except (ValueError, AttributeError, TypeError, OSError, OverflowError):
+        return None
+
+
+def copied_block(raw, sid, nou):
+    """ファイルの頭の、ほかの会話から写した行の数（raw の位置で。これより後ろが、この会話の書いた行）。
+    - 分岐（写した行が元の会話の ID のまま）：頭の、行の会話の ID がほかの会話のものの並び
+    - 分岐（写した行に新しい ID を付け、写した部分の後ろに fork_briefing を置く）：最後の fork_briefing より前
+    - 続き（元の会話の最後の要約の境目（compact_boundary）の写しで始まる）：頭の、続きを始めた時刻
+      （uuid の無い、時刻のある最初の行。無ければ境目の時刻）より前の行（境目、要約、要約の後に残した部分、
+      境目の後の元の会話の行）。最後の行が fork_briefing なら、それは自分の行
+    当てはまるもののうち、いちばん長いもの。"""
+    k = 0
+    while k < len(raw) and raw[k][1] != sid:
+        k += 1
+    fb = [j for j in range(k, len(raw)) if raw[j][3] == "fb"]
+    n = max(k, fb[-1] if fb else 0)
+    if k == 0 and raw and raw[0][3] == "cb":
+        lim = _instant(nou) if nou else None
+        lim = lim or _instant(raw[0][2])
+        t = 1
+        while lim is not None and t < len(raw) and (_instant(raw[t][2]) or lim) < lim:
+            t += 1
+        if raw[t - 1][3] == "fb":
+            t -= 1
+        n = max(n, t)
+    return n
+
+
+def ownership(sessions):
+    """各行の持ち主と、各会話の読める形に載せる部分を、ファイルの形（copied_block）だけから決める。
+    - 行の持ち主（書いた会話）は、その行を写した部分の外に持つ会話。二つ以上あれば（形の崩れた記録）、
+      行の会話の ID が自分のもの、早く始まった、会話の ID の順
+    - 持ち主がいま無い行（除いた、対象の外、この PC に無い）は、持つ会話のうち元に最も近いもの（ほかの持つ会話の
+      祖先でないもの。写した部分の短い、写した後の自分の発言が早い、会話の ID の順）が載せる
+    戻り値：(会話の ID -> [(項目の番号, 部分の始まり, 終わり)]、会話の ID -> 写した部分の行の持ち主（後ろの行から、重ねない）)。
+    項目は、行の持ち主の変わり目で部分に分ける（行ごとに一つの会話だけが載せる。落とさず、二重にしない）。"""
+    blk = {s["id"]: s.get("blk") or 0 for s in sessions}
+    fl = {s["id"]: set(s.get("fl") or ()) for s in sessions}
+    start = {s["id"]: min((x for x in s["ts"] if x), default="") for s in sessions}
+    # 写した部分の後ろの、自分の最初の発言の時刻（写しを作った順。自分の発言の無い写しは後ろ）
+    own0 = {s["id"]: min((t for t, ri in zip(s["ts"], s.get("ri") or ()) if t and any(i is not None and i >= blk[s["id"]] for i in ri)),
+                         default=chr(0xFFFF)) for s in sessions}
+    pos = {}  # 行の uuid -> {持つ会話: その会話での位置}
+    for s in sessions:
+        sid = s["id"]
+        for k, u in enumerate(s.get("raw") or ()):
+            d = pos.get(u)
+            if d is None:
+                pos[u] = {sid: k}
+            elif sid not in d:
+                d[sid] = k
+    memo = {}
+
+    def writer(u):
+        hs = pos[u]
+        if len(hs) == 1:
+            (h, k), = hs.items()
+            return h if k >= blk[h] else None
+        if u not in memo:
+            outs = [h for h, k in hs.items() if k >= blk[h]]
+            memo[u] = min(outs, key=lambda h: (hs[h] in fl[h], start[h], h)) if outs else None
+        return memo[u]
+
+    chain = {}
+    for s in sessions:
+        sid, raw, c = s["id"], s.get("raw") or (), []
+        for k in range(blk[sid] - 1, -1, -1):
+            o = writer(raw[k])
+            if o is not None and o != sid and o not in c:
+                c.append(o)
+        chain[sid] = c
+
+    def ancestors(h):
+        out, x = set(), h
+        while chain[x] and chain[x][0] not in out and chain[x][0] != h:
+            x = chain[x][0]
+            out.add(x)
+        return out
+    anc, near = {}, {}
+
+    def holder(u):
+        o = writer(u)
+        if o is not None:
+            return o
+        if u not in near:
+            hs = pos[u]
+            for h in hs:
+                if h not in anc:
+                    anc[h] = ancestors(h)
+            cands = [h for h in hs if not (anc[h] & hs.keys())] or list(hs)
+            near[u] = min(cands, key=lambda h: (blk[h], own0[h], h))
+        return near[u]
+
+    runs = {}
+    for s in sessions:
+        sid, raw, out = s["id"], s.get("raw") or (), []
+        for k, ri in enumerate(s.get("ri") or ()):
+            who = [sid if i is None else holder(raw[i]) for i in ri] or [sid]
+            a = 0
+            for j in range(1, len(who) + 1):
+                if j == len(who) or who[j] != who[a]:
+                    if who[a] == sid:
+                        out.append((k, a, j))
+                    a = j
+        runs[sid] = out
+    return runs, chain
+
+
+def run_info(s, k, a, b):
+    """会話 s の項目 k の部分 a〜b の (uuid, 時刻, 終わりの時刻, 種類)。項目の全体なら項目の値。"""
+    ri, te = s["ri"][k], (s.get("te") or s["ts"])[k]
+    if a == 0 and b == len(ri):
+        return s["uuids"][k], s["ts"][k], te, s["kinds"][k]
+    rt = s["rt"][str(k)]
+    uuid = s["raw"][ri[a]] if a and ri[a] is not None else s["uuids"][k]
+    ts = s["ts"][k] if a == 0 else rt[a]
+    return uuid, ts, next((x for x in reversed(rt[a:b]) if x), ts), s["kinds"][k]
+
+
+def part_item(it, a, b):
+    """項目の部分 a〜b（Claude の返答の、まとめた行の一部）を、読める形に載せる項目にする。全体ならそのまま。"""
+    if it["kind"] != "claude" or (a == 0 and b == len(it["parts"])):
+        return it
+    ps = it["parts"][a:b]
+    return dict(it, uuid=it["uuid"] if a == 0 else ps[0]["u"] or it["uuid"],
+                ts=it["ts"] if a == 0 else ps[0]["ts"], text="\n\n".join(x for p in ps for x in p["text"]),
+                tools=[x for p in ps for x in p["tools"]])
+
+
+def zone_text(stamps) -> str:
+    """時刻の並びを、この PC の時間帯で書いたときの UTC からの差（「+09:00」。夏時間などで二つ以上なら「 / 」でつなぐ）。"""
+    seen = []
+    for ts in stamps:
+        t = local(ts) if ts else None
+        z = t.strftime("%z") if t else ""
+        z = f"{z[:3]}:{z[3:5]}" if z else ""
+        if z and z not in seen:
+            seen.append(z)
+    return " / ".join(seen)
+
+
+def cut_cycles(parent_of, start_of):
+    """分岐元の輪を切る（輪の中で最も早く始まった会話の分岐元を外す）。外した会話の ID の並びを返す。"""
+    cut = []
+    for sid in sorted(parent_of):
+        seen, x = [], sid
+        while x is not None and x not in seen:
+            seen.append(x)
+            x = parent_of.get(x)
+        if x is not None:
+            cyc = seen[seen.index(x):]
+            root = min(cyc, key=lambda c: (start_of.get(c, ""), c))
+            parent_of[root] = None
+            cut.append(root)
+    return cut
 
 
 def demote(md: str) -> str:
@@ -565,11 +738,13 @@ def hub_commit_map():
     return found
 
 
-def render_digest(s, items, parent_title):
+def render_digest(s, items, parent_title, zone=""):
     L = [f"# 会話（要約するための読める形）：{redact(s['title'])}", "",
          f"- 会話の ID：`{s['id']}`",
          f"- 作業ディレクトリ：`{s['cwd'] or '不明'}`",
          f"- 生の記録：`records/sessions/raw/{s['id']}.jsonl`（`<!-- uuid: … -->` の値で行を探せる）"]
+    if zone:
+        L.append(f"- 時刻の時差（UTC から）：{zone}（この読める形を作ったときの、この PC の時間帯）")
     if parent_title:
         L.append(f"- 分岐元：{redact(parent_title)}。分岐元と同じ部分は省いた")
     L += ["", "道具の結果は載せていない（選択肢での質問と回答は載せる）。git の外のファイル。", ""]
@@ -776,7 +951,11 @@ def auto_block(s, r, parent, commits):
          f"- 会話の ID：`{s['id']}`",
          f"- 作業ディレクトリ：`{s.get('cwd') or '不明'}`"]
     if r["first"] and r["last"]:
-        L.append(f"- 期間：{r['first']:%Y-%m-%d %H:%M} 〜 {r['last']:%Y-%m-%d %H:%M}")
+        # 時差を付ける（この PC のいまの時間帯の時刻。始まりと終わりの時差が同じなら、終わりにだけ付ける）
+        a, b = with_offset(r["first"]), with_offset(r["last"])
+        if a[16:] == b[16:]:
+            a = a[:16]
+        L.append(f"- 期間：{a} 〜 {b}")
     if parent:
         L.append(f"- 分岐元：[{no_marker(one_line(redact(parent['title']), 200))}]({parent['file']})")
     L += [f"- 生の記録：`records/sessions/raw/{s['id']}.jsonl`（git の外。この PC だけ）",
@@ -791,40 +970,73 @@ def auto_block(s, r, parent, commits):
 NOT_SUMMARIZED_RX = re.compile(r"^- 要約した範囲：\s*要約しない", re.M)
 
 
-# 「要約した範囲」の日時。後ろに時間帯（「+09:00」「+0900」）があってもよい
-UNTIL_RX = re.compile(r"(\d{4}-\d{2}-\d{2}) (\d{1,2}):(\d{2})(?:[ \t]*([+-])(\d{2}):?(\d{2})(?![0-9]))?")
+# 「要約した範囲」の日時。秒があってもよい。後ろに時差があってもよい：空白の後ろに「+09:00」「+0900」「+09」「-05:00」
+# 「Z」（符号は全角の「＋」「−」も）、または括弧の中（「（+09:00）」）。「+」と「Z」は、空白が無くてもよい（前と同じ）。
+# 空白も括弧も無い「-」（「10:00-11:30」）は範囲の印として読み、時差にしない
+_TIME = r"(\d{1,2}):(\d{2})(?::(\d{2}))?(?![0-9])"
+_OFF_BODY = r"(?:([+\-＋−])(\d{2})(?::?(\d{2}))?|(Z))(?![0-9:A-Za-z])"
+_OFF = rf"(?:(?:[ \t　]+|(?=[+＋Z])){_OFF_BODY}|[ \t　]*[(（][ \t　]*{_OFF_BODY}[ \t　]*[)）])?"
+UNTIL_RX = re.compile(rf"(\d{{4}}-\d{{2}}-\d{{2}}) {_TIME}{_OFF}")
+# 日時の後ろの「〜 11:30」（同じ日の時刻で終わる範囲）。「〜」「～」か、前後に空白のある「-」で区切ったもの
+UNTIL_TAIL_RX = re.compile(rf"(?:[ \t　]*[〜～][ \t　]*|[ \t　]+-[ \t　]+){_TIME}{_OFF}")
 
 
 def _until_match(text):
+    """「要約した範囲」の行の最後の日時の (日付, 時, 分, 秒か None, 時差の分か None)。日時の後ろに「〜 11:30」が続けば、
+    終わりはその日付のその時刻（時差が無ければ、前の日時の時差）。読めなければ None。"""
     m = re.search(r"^- 要約した範囲：(.*)$", text, re.M)
     if not m:
         return None
-    found = list(UNTIL_RX.finditer(m.group(1)))
-    return found[-1] if found else None
+    line = m.group(1)
+    found = list(UNTIL_RX.finditer(line))
+    if not found:
+        return None
+    f = found[-1]
+    d, g = f.group(1), f.groups()[1:]
+    off = _offset(g[3:])
+    t = UNTIL_TAIL_RX.match(line, f.end())
+    if t:
+        g = t.groups()
+        o = _offset(g[3:])
+        off = off if o is None else o
+    return d, int(g[0]), int(g[1]), (int(g[2]) if g[2] else None), off
+
+
+def _offset(g):
+    """時差の組（空白の後ろの形と、括弧の中の形の、符号・時・分・Z）を分にする。無ければ None。"""
+    for sg, oh, om, z in (g[0:4], g[4:8]):
+        if z:
+            return 0
+        if sg:
+            v = int(oh) * 60 + int(om or 0)
+            return -v if sg in "-−" else v
+    return None
 
 
 def summarized_until(text):
-    """「要約した範囲」の行の、最後の日時（「A 〜 B」なら B）。時間帯が書いてあれば、後ろに「+09:00」の形で付ける。"""
+    """「要約した範囲」の行の、最後の日時（「A 〜 B」なら B）。時差が書いてあれば、後ろに「+09:00」の形で付ける。"""
     m = _until_match(text)
     if not m:
         return None
-    d, h, mi, sg, oh, om = m.groups()
-    return f"{d} {int(h):02d}:{mi}" + (f" {sg}{oh}:{om}" if sg else "")
+    d, h, mi, sec, off = m
+    s = f"{d} {h:02d}:{mi:02d}" + (f":{sec:02d}" if sec is not None else "")
+    if off is not None:
+        s += f" {'-' if off < 0 else '+'}{abs(off) // 60:02d}:{abs(off) % 60:02d}"
+    return s
 
 
 def until_instant(text):
-    """「要約した範囲」の最後の日時を、時刻（時間帯つき）にする。時間帯が書いてあればそれで、無ければこの PC の時間帯で読む
+    """「要約した範囲」の最後の日時を、時刻（時間帯つき）にする。時差が書いてあればそれで、無ければこの PC の時間帯で読む
     （前と同じ）。読めなければ None。"""
     m = _until_match(text)
     if not m:
         return None
-    d, h, mi, sg, oh, om = m.groups()
+    d, h, mi, sec, off = m
     try:
-        t = datetime.strptime(f"{d} {int(h):02d}:{mi}", "%Y-%m-%d %H:%M")
-        if sg:
-            off = timedelta(hours=int(oh), minutes=int(om))
-            return t.replace(tzinfo=timezone(-off if sg == "-" else off))
-        return t.astimezone()  # 時間帯の無い時刻は、この PC の時間帯の時刻として読む
+        t = datetime.strptime(f"{d} {h:02d}:{mi:02d}:{sec or 0:02d}", "%Y-%m-%d %H:%M:%S")
+        if off is not None:
+            return t.replace(tzinfo=timezone(timedelta(minutes=off)))
+        return t.astimezone()  # 時差の無い時刻は、この PC の時間帯の時刻として読む
     except (ValueError, OSError, OverflowError):
         return None
 
@@ -1253,7 +1465,7 @@ def main():
         # 対象かどうかは、記録した作業ディレクトリ（cwd）を、いまの hub/session-sources.txt と毎回照らして決め直す。
         # 作業ディレクトリを足したり外したりしても、会話のファイルを読み直さずに反映されるようにするため
         if c and c.get("key") == key:
-            if "labels" in c:
+            if "raw" in c:
                 if in_scope(c.get("cwd")):
                     return {"id": sid, "path": f, "parsed": None, **c}
                 cache[sid] = {"key": key, "skip": True, "cwd": c.get("cwd"), "talk": True}
@@ -1267,15 +1479,13 @@ def main():
         if not talk or not in_scope(p["cwd"]):
             cache[sid] = {"key": key, "skip": True, "cwd": p["cwd"], "talk": talk}
             return None
-        entry = {"key": key, "title": p["title"], "cwd": p["cwd"],
-                 "uuids": [i["uuid"] for i in p["items"]], "labels": [i["label"] for i in p["items"]],
+        # 持ち主を決めるのに要るのは、ファイルの形だけ：uuid のある行の並び（raw）、写した部分の行の数（blk）、
+        # 各項目の行の raw での位置（ri。Claude の返答は、まとめた行ごと）と、まとめた行の時刻（rt）
+        entry = {"key": key, "title": p["title"], "cwd": p["cwd"], "raw": p["raw"], "blk": p["blk"], "fl": p["fl"],
+                 "uuids": [i["uuid"] for i in p["items"]], "ri": [i["ri"] for i in p["items"]],
+                 "rt": {str(k): [x["ts"] for x in i["parts"]] for k, i in enumerate(p["items"]) if len(i.get("parts") or ()) > 1},
                  "kinds": [i["kind"] for i in p["items"]], "ts": [i["ts"] for i in p["items"]],
-                 "te": [i.get("te") or i["ts"] for i in p["items"]],
-                 # Claude の返答にまとめた行の uuid（最初の行のほかに、まとめた行があるものだけ。{番号: [uuid, …]}）
-                 "members": {str(k): [m for m in i["members"] if m != i["uuid"]] for k, i in enumerate(p["items"])
-                             if any(m != i["uuid"] for m in i.get("members") or ())},
-                 # 分岐元から写した、頭の発言の数（Claude Code が写した部分の後ろに置く行（fork_briefing）より前）
-                 "inh": sum(1 for i in p["items"] if i.get("inh")), "changed": True}
+                 "te": [i.get("te") or i["ts"] for i in p["items"]], "changed": True}
         cache[sid] = entry
         return {"id": sid, "path": f, "parsed": p, **entry}
 
@@ -1341,71 +1551,7 @@ def main():
     def first_ts(s):
         return min((x for x in s["ts"] if x), default="")
     sessions.sort(key=lambda s: (first_ts(s), s["id"]))  # 時刻が同じなら会話の ID の順（読み元によって入れ替わらないように）
-    # 発言の uuid -> 持つ会話の (会話の ID, 行の会話の ID, 発言の番号, 返答の途中の行か)。
-    # Claude の返答は、まとめた行の uuid でも持つ（要約の後に残した部分が、元の会話の返答の途中の行から始まるとき、
-    # 写しの返答の uuid は、元の会話では返答の途中の行になるため）。同じ会話の二つ目は数えない
-    holders = {}
-    for s in sessions:
-        mem = s.get("members") or {}
-        for k, (u, lab) in enumerate(zip(s["uuids"], s["labels"])):
-            hs = holders.setdefault(u, [])
-            if all(h[0] != s["id"] for h in hs):
-                hs.append((s["id"], lab, k, False))
-            for m in mem.get(str(k), ()) if isinstance(mem, dict) else ():
-                hs = holders.setdefault(m, [])
-                if all(h[0] != s["id"] for h in hs):
-                    hs.append((s["id"], lab, k, True))
-    by_id = {s["id"]: s for s in sessions}
-    start_of = {s["id"]: first_ts(s) for s in sessions}
-    held = {u: {h[0] for h in hs} for u, hs in holders.items() if len(hs) > 1}  # 二つ以上の会話が持つ発言
-    inh_of = {s["id"]: s.get("inh") or 0 for s in sessions}
-    plain_memo, outside_memo = {}, {}
-
-    def plain_summary(sid):
-        """この会話の要約のファイルが、もうあり、冒頭の囲みに「分岐元」の行が無いか（前に元の会話と決めた。決め直して
-        入れ替えないため）。囲みの「会話の ID」がこの会話のものだけを見る。"""
-        if sid not in plain_memo:
-            plain_memo[sid] = False
-            for n in sorted(existing.get(sid[:8], [])):
-                t = read_or_none(OUT / n)
-                b = find_auto(t) if t is not None else None
-                if isinstance(b, tuple):
-                    blk = t[b[0]:b[1]]
-                    if sid in AUTO_ID_RX.findall(blk) and not re.search(r"^- 分岐元：", blk, re.M):
-                        plain_memo[sid] = True
-                        break
-        return plain_memo[sid]
-
-    def first_outside(sid, hset):
-        """会話の発言のうち、hset のほかの会話が持たない発言の、最も早い時刻（無ければ、どの時刻より後の字）。"""
-        k = (sid, hset)
-        if k not in outside_memo:
-            s, others_ = by_id[sid], hset - {sid}
-            outside_memo[k] = min((t for u, t in zip(s["uuids"], s["ts"])
-                                   if t and (u not in held or held[u].isdisjoint(others_))), default=chr(0xFFFF))
-        return outside_memo[k]
-
-    # 各発言の持ち主は、その発言を最初に書いた会話。二つ以上の会話が持つ発言（分岐・続き）は、次のように決める：
-    # 1. 写した部分の印（fork_briefing）より前にある会話は、持ち主にしない（ほかに持つ会話があれば）
-    # 2. 持つ会話を、最初に書いた証拠の順に並べる：自分の返答の途中の行として持つ会話（写しは、返答の途中から始まる）、
-    #    その発言より前の発言が多い会話（写した部分は、ファイルの頭にまとめて置かれる。元の会話では自分の流れの中にある）、
-    #    最も早く始まった会話、冒頭の囲みに「分岐元」の無い要約がもうある会話（前に元と決めた）、
-    #    共有しない発言が最も早い会話、会話の ID の順（どの PC でも同じに決まるように）
-    # 3. 行の sessionId が自分の ID の会話のうち、並びの最初のもの。無ければ、行の sessionId が指す、ほかの持つ会話
-    #    （写した行が元の会話の ID を持つ分岐）。それも無ければ並びの最初
-    owner = {}
-    for u, hs in holders.items():
-        if len(hs) == 1:
-            owner[u] = hs[0][0]
-            continue
-        hset = frozenset(held[u])
-        cands = [h for h in hs if h[2] >= inh_of[h[0]]] or hs
-        cids = {h[0] for h in cands}
-        order = sorted(cands, key=lambda h: (not h[3], -h[2], start_of[h[0]], not plain_summary(h[0]),
-                                             first_outside(h[0], hset), h[0]))
-        own_l = [h[0] for h in order if h[1] == h[0]]
-        claimed_by = [h[1] for h in order if h[1] != h[0] and h[1] in cids]
-        owner[u] = own_l[0] if own_l else (claimed_by[0] if claimed_by else order[0][0])
+    runs_of, chain_of = ownership(sessions)
     claimed = set()  # この実行で、どれかの会話が使うと決めた要約のファイル
     claimed8 = {}  # ID の先頭 8 文字 -> この実行で、その先頭 8 文字の会話に最初に決めた要約のファイル
 
@@ -1438,18 +1584,17 @@ def main():
 
     rows = {}
     for s in sessions:
-        own = [i for i, u in enumerate(s["uuids"]) if owner.get(u) == s["id"]]
-        te, kinds = s.get("te") or s["ts"], s.get("kinds") or [""] * len(s["ts"])
-        ts_own = sorted(s["ts"][i] for i in own if s["ts"][i])
-        te_own = sorted(te[i] for i in own if te[i])
-        talk_own = sorted(s["ts"][i] for i in own if s["ts"][i] and kinds[i] in ("user", "answer"))
+        own = [run_info(s, *x) for x in runs_of[s["id"]]]  # (uuid, 時刻, 終わりの時刻, 種類)
+        ts_own = sorted(x[1] for x in own if x[1])
+        te_own = sorted(x[2] for x in own if x[2])
+        talk_own = sorted(x[1] for x in own if x[1] and x[3] in ("user", "answer"))
         # ほかの会話・アプリが送った発言（切り出した作業の起動の文など）。要約のファイルを作るかには数え、
         # 要約した範囲の後に発言が増えたかには数えない（研究者の発言ではないため）
-        sent_own = any(s["ts"][i] for i in own if kinds[i] == "sent")
+        sent_own = any(x[1] for x in own if x[3] == "sent")
         # 読めない時刻（1970 年より前など）は飛ばし、読める時刻の最初と最後を使う
         first = readable(ts_own)
         last = readable(reversed(te_own))
-        s["own_idx"] = own
+        s["own"] = own
         # 新しく要約のファイルを作るのは、自分の発言（研究者の発言か選択肢の回答、ほかの会話からの起動の文）があるときだけ
         # （引数の無いコマンドと Claude の返答だけの分岐は、記録の対象の判定と同じに、自分の発言なしとする）。
         # もうあるファイルは使い続ける
@@ -1468,38 +1613,11 @@ def main():
             print(f"{when}  {s['id'][:8]}  own={r['n_own']:5d}  {r['title'][:50]}")
         return
 
-    def find_parent(s, skip=()):
-        """分岐元は、受け継いだ発言のうち最後のものの持ち主（分岐を作った会話。分岐の分岐では、その前の分岐）。
-        要約のファイルのある会話だけを数える。skip の会話は数えない。"""
-        for u in reversed(s["uuids"]):
-            o = owner.get(u)
-            if o and o != s["id"] and o not in skip and rows[o]["file"]:
-                return o
-        return None
-
-    parent_of = {s["id"]: find_parent(s) for s in sessions}
-    # 分岐元が輪になれば（A の分岐元が B で、B の分岐元が A など）、輪の中で、ほかの会話と共有する発言を最も多く持つ会話
-    # （持ち主の順で元になる会話）の分岐元だけを、輪の外から決め直す
-    skips = {}
-    for _ in range(len(sessions) + 1):
-        cycle = None
-        for sid in parent_of:
-            seen_p, x = [], sid
-            while x is not None and x not in seen_p:
-                seen_p.append(x)
-                x = parent_of.get(x)
-            if x is not None:
-                cycle = seen_p[seen_p.index(x):]
-                break
-        if not cycle:
-            break
-        cset = set(cycle)
-
-        def owns_shared(c):
-            return sum(1 for u in by_id[c]["uuids"] if owner.get(u) == c and held.get(u, set()) & (cset - {c}))
-        root = sorted(cycle, key=lambda c: (-owns_shared(c), start_of[c], c))[0]
-        skips[root] = skips.get(root, set()) | cset
-        parent_of[root] = find_parent(by_id[root], skips[root])
+    # 分岐元は、写した部分の最後の行の持ち主（その会話を作った元の会話）。要約のファイルの無い会話（この PC に無い、
+    # 除いた、対象の外、自分の発言の無い会話）なら、写した部分のより前の行の持ち主をたどる
+    parent_of = {s["id"]: next((o for o in chain_of[s["id"]] if rows[o]["file"]), None) for s in sessions}
+    start_of = {s["id"]: first_ts(s) for s in sessions}
+    cut = cut_cycles(parent_of, start_of)  # この決め方では輪にならない。なったときの安全のため（外した分岐元を知らせる）
 
     commits_of = hub_commit_map()
     git_ok = commits_of is not None
@@ -1518,16 +1636,17 @@ def main():
                 skipped.append((r["clash"], f"{CLASH}。会話 {s['id']} の要約は作らない"))
             continue
         dg = DIGEST / f"{s['id']}.md"
-        # 読める形は、会話のファイルが変わったときだけでなく、持ち主の決まり方（分岐元）が変わったときにも作り直す
-        own_sig = hashlib.sha1(("\n".join(s["uuids"][i] or "" for i in s["own_idx"]) + "|" +
-                                (parent["file"] if parent else "")).encode("utf-8", "replace")).hexdigest()
+        # 読める形は、会話のファイルが変わったときだけでなく、持ち主の決まり方（分岐元）か、時刻を書く時間帯が
+        # 変わったときにも作り直す
+        zone = zone_text(x[1] for x in s["own"])
+        own_sig = hashlib.sha1(("\n".join(f"{k} {a_} {b_}" for k, a_, b_ in runs_of[s["id"]]) + "|" +
+                                (parent["file"] if parent else "") + "|" + zone).encode("utf-8", "replace")).hexdigest()
         if s.get("changed") or not dg.exists() or cache[s["id"]].get("own_sig") != own_sig:
             saving["n"] += 1
             try:
                 p = s["parsed"] or parse(s["path"])
-                own_set = {s["uuids"][i] for i in s["own_idx"]}
-                items = [i for i in p["items"] if i["uuid"] in own_set]
-                write_text(dg, render_digest(p, items, parent["title"] if parent else None))
+                items = [part_item(p["items"][k], a_, b_) for k, a_, b_ in runs_of[s["id"]]]
+                write_text(dg, render_digest(p, items, parent["title"] if parent else None, zone))
                 cache[s["id"]]["own_sig"] = own_sig
             except Exception as e:  # 読める形が作れなくても、要約のファイルと一覧は続ける
                 cache[s["id"]].pop("own_sig", None)
@@ -1584,7 +1703,9 @@ def main():
         elif lt is None:
             r["pending"] = False
         elif ui is not None:
-            r["pending"] = r["talk"] and lt.replace(second=0, microsecond=0) > ui
+            # 秒まで書いてあれば秒まで比べる
+            sec = _until_match(new)[3] is not None
+            r["pending"] = r["talk"] and lt.replace(microsecond=0, **({} if sec else {"second": 0})) > ui
         else:
             r["pending"] = r["talk"] and f"{lt:%Y-%m-%d %H:%M}" > until
         cache[s["id"]].pop("changed", None)
@@ -1640,6 +1761,10 @@ def main():
         print("次の会話の記録は飛ばした（ほかの会話は続けた）：")
         for f, why in failed:
             print(f"  {f}（{why}）")
+    if cut and not a.hook:
+        print("分岐元が輪になったので、次の会話の分岐元を外した（会話の記録の形が崩れている）：")
+        for x in cut:
+            print(f"  {x}")
     if not git_ok and not a.hook:
         print("git が動かなかったので、要約の冒頭の囲み（ハブのコミットの一覧など）は書き換えなかった")
     if saving["err"] and not a.hook:

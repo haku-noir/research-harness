@@ -171,12 +171,14 @@ def first_cwd(f: Path):
 def scan(files):
     rows, seen_uuid, seen_text = [], set(), set()
     for f in files:
-        sid = f.stem[:8]
         with open(f, encoding="utf-8", errors="replace") as fh:
             for d in records(fh):
                 t = user_text(d)
                 if not t:
                     continue
+                # 出す [id] は、行の会話の ID（分岐で写した行は、写した元の会話の ID を持つ）。無ければファイルの会話
+                s_ = d.get("sessionId")
+                sid = (s_ if isinstance(s_, str) and s_ else f.stem)[:8]
                 dt = local_time(d.get("timestamp", ""))
                 if dt is None:
                     continue
