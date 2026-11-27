@@ -43,7 +43,9 @@
    ```
 
    マージのコミットも、説明はハブのコミットの形（前・理由・きっかけと `Hub-Agent:` などの行。`CLAUDE.md` の「現在の文書と履歴」）で書く。`--no-commit` を付けずにマージすると、git が決まった文の説明でコミットしてしまうため。きっかけには研究者の指示を書く。
-4. **マージした後**：統括が `hub/state.md` の論旨の版を直し、`git worktree remove .claude/worktrees/<名前>` でワークツリーを外す。ブランチは消さない（ハブの中のブランチは消さない。`CLAUDE.md` の「履歴を書き換えない」）。
+4. **マージした後**：統括が `hub/state.md` の論旨の版を直し、`git worktree remove .claude/worktrees/<名前>` でワークツリーを外す。ブランチは消さない（ハブの中のブランチは消さない。`CLAUDE.md` の「履歴を書き換えない」）。外す前に、次の二つを確かめる。
+   - そこで動いていた作業の会話が終わったことを、研究者に確かめる。
+   - git が追わないファイル（`papers/*/export/` など）で、残すものが無いか（`git -C .claude/worktrees/<名前> status --short --ignored`）。`git worktree remove` は、`.gitignore` で外したファイルを、確かめずに消すため。残すものは、外す前に研究者と置き場所を決めて写す。
 
 ## 新しい指導教員の発言
 
