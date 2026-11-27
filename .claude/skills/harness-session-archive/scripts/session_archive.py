@@ -544,6 +544,7 @@ def _instant(ts):
 
 
 BIRTH_SLACK = 2  # 秒。続きの自分の最初の行は、ファイルが作られた時刻より少し前の時刻を持つことがある
+BIRTH_NEAR = 60  # 秒。uuid の無い時刻つきの行の無い続きは、作られた時刻からこの秒数の内に行があるときだけ、作られた時刻で決める
 
 
 def birth_time(st):
@@ -573,8 +574,9 @@ def copied_block(raw, sid, nou, birth=None):
       境目の後の元の会話の行）。ファイルの作られた時刻 birth（エポック秒。分かるときだけ）の BIRTH_SLACK 秒前が、
       その時刻より前なら、その時刻より前の行（CLI では、uuid の無い行が、続きの自分の最初の発言の後にしか無いことが
       ある）。作られた時刻は写した部分を短くするだけで、ほかの PC から写したファイルのように後ろなら使わない。
-      ただし uuid の無い時刻つきの行が一つも無く、作られた時刻が最後の行の時刻より後ろでなければ、境目の時刻の
-      代わりに、作られた時刻の BIRTH_SLACK 秒前を使う。最後の行が fork_briefing なら、それは自分の行
+      ただし uuid の無い時刻つきの行が一つも無く、作られた時刻が最後の行の時刻より後ろでなく、作られた時刻の
+      BIRTH_SLACK 秒前からの最初の行が作られた時刻から BIRTH_NEAR 秒の内にあれば、境目の時刻の代わりに、作られた
+      時刻の BIRTH_SLACK 秒前を使う。最後の行が fork_briefing なら、それは自分の行
     当てはまるもののうち、いちばん長いもの。"""
     k = 0
     while k < len(raw) and raw[k][1] != sid:
@@ -586,9 +588,14 @@ def copied_block(raw, sid, nou, birth=None):
         b = _birth_instant(birth)
         if lim is None and b is not None:
             # uuid の無い時刻つきの行が無い：境目の時刻は当てにならないので、作られた時刻が続きを始めた時刻として
-            # ありうる（最後の行の時刻より後ろでない。後ろなら、ほかから写したファイル）なら、それを使う
-            last = max((x for x in map(_instant, (r[2] for r in raw)) if x is not None), default=None)
-            if last is not None and b + timedelta(seconds=BIRTH_SLACK) <= last:
+            # ありうるなら、それを使う。ありうるのは、最後の行の時刻より後ろでなく（後ろなら、ほかから写したファイル）、
+            # 作られた時刻の BIRTH_SLACK 秒前からの最初の行が、作られた時刻から BIRTH_NEAR 秒の内にあるとき（離れて
+            # いれば、作られた時刻はほかから写した時刻で、写した後に会話が続いた）
+            xs = [x for x in map(_instant, (r[2] for r in raw)) if x is not None]
+            last = max(xs, default=None)
+            near = min((x for x in xs if x >= b), default=None)
+            if (last is not None and b + timedelta(seconds=BIRTH_SLACK) <= last
+                    and near is not None and near <= b + timedelta(seconds=BIRTH_SLACK + BIRTH_NEAR)):
                 lim = b
         lim = lim or _instant(raw[0][2])
         if lim is not None and b is not None and b < lim:
@@ -1007,7 +1014,7 @@ NOT_SUMMARIZED_RX = re.compile(r"^- 要約した範囲：\s*要約しない", re
 
 # 「要約した範囲」の日時。秒があってもよい。後ろに時差があってもよい：空白の後ろに「+09:00」「+0900」「+09」「-05:00」
 # 「Z」（符号は全角の「＋」「−」「－」も）、または括弧の中（「（+09:00）」）。「+」と「Z」は、空白が無くてもよい（前と同じ）。
-# 空白も括弧も無い「-」（「10:00-11:30」）は範囲の印として読み、時差にしない。
+# 空白も括弧も無い「-」（「10:00-11:30」）は時差にしない（範囲の印にもしない。範囲の印は、前後に空白のある「-」）。
 # 時差として読むのは、実際にある時差だけ：−12 から +14 までのちょうどの時と、使われている 30 分・45 分のずれ
 # （「10:00 -11:30」の「-11:30」は時差にしない）
 _OFF_POS = r"(?:0\d|1[0-4])(?::?00)?|(?:0[3-6]|09|10):?30|(?:05|08|12|13):?45"
@@ -1024,8 +1031,8 @@ UNTIL_TAIL_RX = re.compile(rf"(?:[ \t　]*[〜～][ \t　]*|[ \t　]+-[ \t　]+)
 
 def _until_match(text):
     """「要約した範囲」の行の最後の日時の (日付, 時, 分, 秒か None, 時差の分か None)。日時の後ろに「〜 11:30」が続けば、
-    終わりはその日付のその時刻（時差が無ければ、前の日時の時差）。その時刻が前の日時の時刻より前なら、次の日の時刻
-    （「2026-01-10 23:00 〜 01:30」）。読めなければ None。"""
+    終わりはその時刻（時差が無ければ、前の日時の時差）で、前の日時から後ろの最初のもの（時差も入れて比べる。
+    「2026-01-10 23:00 〜 01:30」は次の日。両端の時差が違えば、前の日のこともある）。読めなければ None。"""
     m = re.search(r"^- 要約した範囲：(.*)$", text, re.M)
     if not m:
         return None
@@ -1038,15 +1045,41 @@ def _until_match(text):
     off = _offset(g[3:])
     t = UNTIL_TAIL_RX.match(line, f.end())
     if t:
-        start = (int(g[0]), int(g[1]), int(g[2] or 0))
+        s0 = g
         g = t.groups()
         o = _offset(g[3:])
+        so = off if off is not None else o  # 始まりの時差（無ければ、終わりの時差）
         off = off if o is None else o
-        if (int(g[0]), int(g[1]), int(g[2] or 0)) < start:
+        # 終わりは、始まりの時刻から後ろ（同じ時刻を含む）の、終わりの時差でその時刻になる最初の時刻（時差も比べる。
+        # 終わりに秒が無ければ、始まりの秒を切り捨てて比べる）。日付は、終わりの時差での日付
+        try:
+            day = datetime.strptime(d, "%Y-%m-%d")
+        except (ValueError, OverflowError):
+            day = None  # 読めない日付は、前と同じに読む（until_instant が読めない時刻とする）
+        if day is not None:
             try:
-                d = (datetime.strptime(d, "%Y-%m-%d") + timedelta(days=1)).strftime("%Y-%m-%d")
-            except (ValueError, OverflowError):
-                pass  # 読めない日付は、前と同じに読む（until_instant が読めない時刻とする）
+                a = day.replace(hour=int(s0[0]), minute=int(s0[1]), second=int(s0[2] or 0) if g[2] else 0)
+                b = day.replace(hour=int(g[0]), minute=int(g[1]), second=int(g[2] or 0))
+                a = a.replace(tzinfo=timezone(timedelta(minutes=so))) if so is not None else a.astimezone()
+                b = b.replace(tzinfo=timezone(timedelta(minutes=off))) if off is not None else b.astimezone()
+            except (ValueError, OSError, OverflowError):
+                a = b = None
+            if a is None:
+                # 読めない時刻（「25:00」など）は、前と同じに、時・分・秒の数で比べる
+                if (int(g[0]), int(g[1]), int(g[2] or 0)) < (int(s0[0]), int(s0[1]), int(s0[2] or 0)):
+                    try:
+                        d = (day + timedelta(days=1)).strftime("%Y-%m-%d")
+                    except (ValueError, OverflowError):
+                        pass
+            else:
+                try:
+                    while b < a:
+                        b += timedelta(days=1)
+                    while b - timedelta(days=1) >= a:
+                        b -= timedelta(days=1)
+                    d = b.strftime("%Y-%m-%d")
+                except (ValueError, OverflowError):
+                    pass
     return d, int(g[0]), int(g[1]), (int(g[2]) if g[2] else None), off
 
 

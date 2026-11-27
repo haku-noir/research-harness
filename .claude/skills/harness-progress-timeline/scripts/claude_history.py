@@ -172,9 +172,10 @@ def first_cwd(f: Path):
 
 
 def load_copied_block():
-    """session_archive.py（harness-session-archive）の copied_block（ファイルの頭の、ほかの会話から写した部分）を、
-    同じ決め方を使うために読み込む。読み込むだけで、そのスクリプトの main は動かさず、__pycache__ も作らない。
-    読み込めなければ None（行の会話の ID で出す、前の出し方にする）。"""
+    """session_archive.py（harness-session-archive）の copied_block（ファイルの頭の、ほかの会話から写した部分）と
+    birth_time（ファイルの作られた時刻）を、同じ決め方を使うために読み込む。読み込むだけで、そのスクリプトの main は
+    動かさず、__pycache__ も作らない。読み込めなければ (None, None)（行の会話の ID で出す、前の出し方にする）。
+    birth_time だけが無ければ、(copied_block, None)。"""
     try:
         p = Path(__file__).resolve().parents[2] / "harness-session-archive" / "scripts" / "session_archive.py"
         spec = importlib.util.spec_from_file_location("_session_archive_for_history", p)
@@ -184,14 +185,14 @@ def load_copied_block():
             spec.loader.exec_module(mod)
         finally:
             sys.dont_write_bytecode = keep
-        return mod.copied_block
+        return mod.copied_block, getattr(mod, "birth_time", None)
     except (Exception, SystemExit):
-        return None
+        return None, None
 
 
 def scan(files):
     rows, seen_uuid, seen_text = [], set(), set()
-    block = load_copied_block()
+    block, born = load_copied_block()
     # 行の uuid -> その行を、写した部分の外に持つ会話（その行を書いた会話）。二つ以上あれば（形の崩れた記録）、
     # 行の会話の ID が自分のもの、会話の ID の順
     writer = {}
@@ -232,7 +233,14 @@ def scan(files):
                 rows.append((dt, sid, f.parent.name, t, d.get("type") == "attachment", u))
         if block is not None:
             try:
-                n = block(raw, f.stem, nou)
+                birth = born(f.stat()) if born is not None else None  # session_archive.py と同じ、作られた時刻
+            except Exception:
+                birth = None
+            try:
+                try:
+                    n = block(raw, f.stem, nou, birth)
+                except TypeError:
+                    n = block(raw, f.stem, nou)  # 作られた時刻を受け取らない copied_block（前の版）
             except Exception:
                 n = None  # 決められなければ、このファイルの行は前の出し方にする
             if n is not None:
